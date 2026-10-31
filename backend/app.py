@@ -7,7 +7,11 @@ import math
 import os
 import re
 import secrets
+import io
+import posixpath
 import sqlite3
+import zipfile
+import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta
 from functools import wraps
 from pathlib import Path
@@ -15,27 +19,42 @@ from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 from flask import Flask, Response, abort, g, jsonify, redirect, request, send_from_directory, session
+from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
 
 try:
-    from database import DATABASE_PATH, get_connection, initialize_database
+    from database import DATA_DIR, DATABASE_PATH, get_connection, initialize_database
+    import face_enrollment
 except ModuleNotFoundError:  # pragma: no cover - supports running from repo root
-    from backend.database import DATABASE_PATH, get_connection, initialize_database
+    from backend.database import DATA_DIR, DATABASE_PATH, get_connection, initialize_database
+    from backend import face_enrollment
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-COVER_DIRECTORY = Path(__file__).resolve().parent / "uploads" / "book_covers"
-FACE_DIRECTORY = Path(__file__).resolve().parent / "uploads" / "person_faces"
+# Uploads live on the Render persistent disk when SMART_LIBRARY_DATA_DIR is set,
+# otherwise in the original backend/uploads folder.
+UPLOAD_ROOT = (DATA_DIR / "uploads") if DATA_DIR else (Path(__file__).resolve().parent / "uploads")
+COVER_DIRECTORY = UPLOAD_ROOT / "book_covers"
+FACE_DIRECTORY = UPLOAD_ROOT / "person_faces"
+IS_RENDER = os.environ.get("RENDER") == "true"
 MAX_COVER_SIZE = 5 * 1024 * 1024
 MANILA_TIME = ZoneInfo("Asia/Manila")
 app = Flask(__name__)
+_secret_key = os.environ.get("SMART_LIBRARY_SECRET", "")
+if not _secret_key:
+    if IS_RENDER:
+        raise RuntimeError("SMART_LIBRARY_SECRET must be set when running on Render.")
+    _secret_key = "local-development-key-change-before-deployment"
 app.config.update(
-    SECRET_KEY=os.environ.get("SMART_LIBRARY_SECRET", "local-development-key-change-before-deployment"),
+    SECRET_KEY=_secret_key,
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=os.environ.get("SMART_LIBRARY_HTTPS", "0") == "1",
+    SESSION_COOKIE_SECURE=os.environ.get("SMART_LIBRARY_HTTPS", "1" if IS_RENDER else "0") == "1",
     MAX_CONTENT_LENGTH=MAX_COVER_SIZE + 64 * 1024,
 )
+if IS_RENDER:
+    # Render terminates HTTPS at its proxy; trust one hop so Flask sees https and the real client.
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 initialize_database()
 
 
@@ -688,7 +707,7 @@ def find_book_by_barcode():
         return api_error("Enter or scan a barcode.")
     with get_connection() as connection:
         book = connection.execute(
-            """SELECT id, book_number, barcode, title, author, category, published_date,
+            """SELECT id, book_number, barcode, title, author, category, published_date, cover_image,
                       quantity, available_quantity,
                       CASE WHEN available_quantity > 0 THEN 'Available' ELSE 'Not Available' END AS status
                FROM books WHERE barcode = ? AND status = 'active'""",
@@ -901,15 +920,26 @@ def delete_book(book_id):
 @app.get("/api/borrowers")
 @login_required
 def find_borrowers():
-    search = f"%{request.args.get('q', '').strip()}%"
+    term = request.args.get("q", "").strip()
     with get_connection() as connection:
-        rows = connection.execute(
-            """SELECT id, school_id, name, email, role, department FROM users
-               WHERE status = 'active' AND role IN ('Student', 'Faculty')
-               AND (school_id LIKE ? OR name LIKE ? OR email LIKE ?)
-               ORDER BY name COLLATE NOCASE LIMIT 20""",
-            (search, search, search),
-        ).fetchall()
+        if request.args.get("exact") == "1":
+            # Exact School ID match (used by the Borrow Book auto-fill)
+            rows = connection.execute(
+                """SELECT id, school_id, name, email, role, department FROM users
+                   WHERE status = 'active' AND role IN ('Student', 'Faculty')
+                   AND LOWER(school_id) = LOWER(?)
+                   ORDER BY name COLLATE NOCASE LIMIT 20""",
+                (term,),
+            ).fetchall()
+        else:
+            search = f"%{term}%"
+            rows = connection.execute(
+                """SELECT id, school_id, name, email, role, department FROM users
+                   WHERE status = 'active' AND role IN ('Student', 'Faculty')
+                   AND (school_id LIKE ? OR name LIKE ? OR email LIKE ?)
+                   ORDER BY name COLLATE NOCASE LIMIT 20""",
+                (search, search, search),
+            ).fetchall()
     return jsonify({"borrowers": [dict(row) for row in rows]})
 
 
@@ -938,13 +968,13 @@ def borrow_book():
         date.fromisoformat(due_date)
     except (ValueError, TypeError):
         return api_error("Choose a valid book, borrower school ID, and due date.")
-    if institutional_email and (
-        len(institutional_email) > 254
-        or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", institutional_email)
-    ):
-        return api_error("Enter a valid institutional email address.")
     if not institutional_email:
-        institutional_email = None
+        return api_error("Enter the borrower's institutional email address.")
+    if len(institutional_email) > 254 or not re.fullmatch(
+        r"[A-Za-z0-9._%+-]+@paterostechnologicalcollege\.edu\.ph", institutional_email, re.IGNORECASE
+    ):
+        return api_error("The institutional email must end with @paterostechnologicalcollege.edu.ph.")
+    institutional_email = institutional_email.lower()
 
     try:
         with get_connection() as connection:
@@ -970,8 +1000,6 @@ def borrow_book():
                 return api_error("Book not found.", 404)
             if not borrower:
                 return api_error("No active student or faculty member has that school ID.", 404)
-            if not institutional_email:
-                institutional_email = borrower["email"]
             if book["available_quantity"] < 1:
                 return api_error("There are no available copies of this book.", 409)
             connection.execute(
@@ -1403,7 +1431,7 @@ def create_person():
     data = request.get_json(silent=True) or {}
     try:
         person = validate_person(data)
-        email = person["school_id"].lower() + "@people.smartlibrary.local"
+        email = person["school_id"].lower() + "@paterostechnologicalcollege.edu.ph"
         with get_connection() as connection:
             cursor = connection.execute(
                 """INSERT INTO users
@@ -1451,6 +1479,438 @@ def update_person(person_id):
         return api_error("That School ID is already registered.", 409)
 
 
+# ---------------------------------------------------------------------------
+# People Information: Excel import + School ID lookup
+# ---------------------------------------------------------------------------
+MAX_IMPORT_ROWS = 5000
+MAX_IMPORT_ERRORS_SHOWN = 50
+MAX_HEADER_SCAN_ROWS = 20
+MAX_IMPORT_SHEETS = 10
+PERSON_ROLES = {
+    "student": "Student", "students": "Student", "learner": "Student", "pupil": "Student",
+    "faculty": "Faculty", "teacher": "Faculty", "instructor": "Faculty", "professor": "Faculty",
+    "lecturer": "Faculty",
+    "staff": "Staff", "employee": "Staff", "personnel": "Staff", "non-teaching": "Staff",
+    "nonteaching": "Staff",
+    "other": "Other", "visitor": "Other", "guest": "Other", "alumni": "Other", "alumnus": "Other",
+}
+ACTIVE_STATUS_WORDS = {"active", "regular", "irregular", "new", "transferee", "returnee",
+                       "continuing", "enrolled", "officially enrolled"}
+INACTIVE_STATUS_WORDS = {"inactive", "dropped", "withdrawn", "graduated", "leave of absence", "loa"}
+
+# Column matching. Headers are compared after removing spaces and punctuation, so
+# "ID No.", "Id no" and "ID_NO" are all "idno". Any column that is not matched is ignored.
+EXACT_HEADERS = {
+    "school_id": ("schoolid", "schoolidno", "schoolidnumber", "id", "idno", "idnumber", "idnum",
+                  "studentid", "studentno", "studentnumber", "facultyid", "employeeid", "employeeno"),
+    "name": ("name", "fullname", "completename", "personname", "studentname", "facultyname",
+             "employeename"),
+    "last_name": ("lastname", "surname", "familyname", "lname"),
+    "first_name": ("firstname", "givenname", "fname"),
+    "middle_name": ("middlename", "middleinitial", "mname", "mi"),
+    "suffix": ("suffix", "extensionname", "nameextension", "extension"),
+    "role": ("role", "persontype", "usertype", "type", "category", "position", "designation"),
+    "department": ("department", "dept", "program", "course", "courseprogram", "courseorprogram",
+                   "programcourse", "college", "departmentcourse"),
+    "contact": ("contact", "contactno", "contactnumber", "contactinformation", "phone", "phoneno",
+                "phonenumber", "mobile", "mobileno", "mobilenumber", "cellphone", "cellphonenumber",
+                "cp", "cpno", "telephone"),
+    "status": ("status", "accountstatus", "personstatus", "enrollmentstatus", "enrolmentstatus",
+               "studentstatus"),
+}
+# Fallback when no exact match exists: the header merely contains one of these words.
+KEYWORD_HEADERS = (
+    ("school_id", ("schoolid", "studentid", "studentno", "studentnumber", "employeeid",
+                   "facultyid", "idnumber", "idno")),
+    ("department", ("department", "dept", "program", "course", "college")),
+    ("contact", ("contact", "mobile", "phone", "telephone", "cellphone")),
+    ("status", ("status",)),
+    ("role", ("role", "persontype", "usertype")),
+    ("name", ("fullname", "completename", "studentname", "facultyname", "employeename", "personname")),
+)
+# Headers containing these words are never used by the keyword fallback
+# (e.g. "Father's Name", "Civil Status", "Emergency Contact No.", "Email Address").
+EXCLUDED_HEADER_WORDS = (
+    "father", "mother", "guardian", "parent", "spouse", "emergency", "maiden", "civil", "marital",
+    "email", "address", "relationship", "birth", "yearlevel", "semester", "section", "schoolyear",
+    "schoolname", "collegename", "contactperson",
+)
+FIELD_LABELS = {
+    "school_id": "School ID", "name": "Name", "last_name": "Name (last name)",
+    "first_name": "Name (first name)", "middle_name": "Name (middle name)", "suffix": "Name (suffix)",
+    "role": "Role", "department": "Department", "contact": "Contact", "status": "Status",
+}
+XLSX_MAIN = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+XLSX_REL = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+SQL_SCHOOL_ID_KEY = "REPLACE(REPLACE(REPLACE(REPLACE(LOWER(school_id), '-', ''), ' ', ''), '_', ''), '.', '')"
+
+
+def import_status(raw):
+    """Map enrolment wording (REGULAR, IRREGULAR, DROPPED...) to the system's Active / Inactive."""
+    word = raw.strip().lower()
+    if not word or word in ACTIVE_STATUS_WORDS:
+        return "active"
+    if word in INACTIVE_STATUS_WORDS:
+        return "inactive"
+    return raw
+
+
+def school_id_key(value):
+    """'23BSIT-0177', '23bsit 0177' and '23BSIT0177' are treated as the same School ID."""
+    return re.sub(r"[\s\-_.]", "", str(value)).lower()
+
+
+def tidy(value):
+    return " ".join(str(value).split())
+
+
+def clean_contact(value):
+    value = tidy(value)
+    # Excel drops the leading zero of numeric mobile numbers (9171234567 -> 09171234567).
+    return "0" + value if re.fullmatch(r"9\d{9}", value) else value
+
+
+def spreadsheet_number_text(number):
+    """Excel stores numbers as floats; 20229512.0 should be imported as 20229512."""
+    if isinstance(number, bool):
+        return "TRUE" if number else "FALSE"
+    if isinstance(number, float):
+        return str(int(number)) if number.is_integer() else repr(number)
+    return str(number)
+
+
+def xlsx_column_index(reference):
+    letters = re.match(r"[A-Za-z]+", reference or "")
+    if not letters:
+        return None
+    index = 0
+    for char in letters.group(0).upper():
+        index = index * 26 + (ord(char) - 64)
+    return index - 1
+
+
+def parse_xlsx_sheet(archive, path, shared):
+    rows = []
+    for row in ET.fromstring(archive.read(path)).iter(XLSX_MAIN + "row"):
+        values = {}
+        next_index = 0
+        for cell in row.findall(XLSX_MAIN + "c"):
+            index = xlsx_column_index(cell.get("r"))
+            index = next_index if index is None else index
+            next_index = index + 1
+            kind = cell.get("t")
+            raw = cell.find(XLSX_MAIN + "v")
+            if kind == "inlineStr":
+                text = "".join(node.text or "" for node in cell.iter(XLSX_MAIN + "t"))
+            elif raw is None or raw.text is None:
+                text = ""
+            elif kind == "s":
+                try:
+                    text = shared[int(raw.text)]
+                except (ValueError, IndexError):
+                    text = ""
+            elif kind == "b":
+                text = "TRUE" if raw.text.strip() == "1" else "FALSE"
+            elif kind in ("str", "e"):
+                text = raw.text
+            else:
+                try:
+                    text = spreadsheet_number_text(float(raw.text))
+                except ValueError:
+                    text = raw.text
+            values[index] = text.strip()
+        width = (max(values) + 1) if values else 0
+        rows.append((int(row.get("r") or len(rows) + 1), [values.get(i, "") for i in range(width)]))
+    return rows
+
+
+def read_xlsx_sheets(content):
+    """Return [(sheet name, rows)] for an .xlsx file using only the standard library."""
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(content))
+    except zipfile.BadZipFile:
+        raise ValueError("This file is not a valid Excel (.xlsx) workbook.")
+    with archive:
+        if sum(item.file_size for item in archive.infolist()) > 80 * 1024 * 1024:
+            raise ValueError("This workbook is too large to import.")
+        names = set(archive.namelist())
+        if "xl/workbook.xml" not in names:
+            raise ValueError("This file is not a valid Excel (.xlsx) workbook.")
+
+        shared = []
+        if "xl/sharedStrings.xml" in names:
+            for item in ET.fromstring(archive.read("xl/sharedStrings.xml")).iter(XLSX_MAIN + "si"):
+                parts = []
+                for child in item:
+                    if child.tag == XLSX_MAIN + "t":
+                        parts.append(child.text or "")
+                    elif child.tag == XLSX_MAIN + "r":
+                        parts.extend(node.text or "" for node in child.findall(XLSX_MAIN + "t"))
+                shared.append("".join(parts))
+
+        sheets = []
+        try:
+            targets = {}
+            for relation in ET.fromstring(archive.read("xl/_rels/workbook.xml.rels")):
+                target = relation.get("Target", "")
+                targets[relation.get("Id")] = (
+                    target.lstrip("/") if target.startswith("/") else posixpath.normpath("xl/" + target)
+                )
+            workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+            for sheet in workbook.find(XLSX_MAIN + "sheets"):
+                path = targets.get(sheet.get(XLSX_REL + "id"))
+                if path in names:
+                    sheets.append((sheet.get("name") or path, path))
+        except (KeyError, AttributeError, TypeError, ET.ParseError):
+            sheets = []
+        if not sheets:
+            sheets = [(Path(name).stem, name) for name in sorted(names)
+                      if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", name)]
+        if not sheets:
+            raise ValueError("The workbook has no worksheet to import.")
+        return [(name, parse_xlsx_sheet(archive, path, shared)) for name, path in sheets[:MAX_IMPORT_SHEETS]]
+
+
+def read_xls_sheets(content):
+    """Return [(sheet name, rows)] for a legacy .xls file (needs the optional xlrd package)."""
+    try:
+        import xlrd
+    except ImportError:
+        raise ValueError(
+            "Legacy .xls files need the 'xlrd' package (run: pip install xlrd). "
+            "Alternatively, open the file in Excel and save it as .xlsx."
+        )
+    try:
+        workbook = xlrd.open_workbook(file_contents=content)
+    except Exception:
+        raise ValueError("This file is not a valid Excel (.xls) workbook.")
+    sheets = []
+    for sheet in workbook.sheets()[:MAX_IMPORT_SHEETS]:
+        rows = []
+        for number in range(sheet.nrows):
+            cells = [spreadsheet_number_text(value) if isinstance(value, (int, float)) else str(value).strip()
+                     for value in sheet.row_values(number)]
+            rows.append((number + 1, cells))
+        sheets.append((sheet.name, rows))
+    return sheets
+
+
+def read_spreadsheet_sheets(content):
+    if content[:4] == b"PK\x03\x04":
+        return read_xlsx_sheets(content)
+    if content[:8] == bytes.fromhex("D0CF11E0A1B11AE1"):
+        return read_xls_sheets(content)
+    raise ValueError("This file is not a valid Excel workbook (.xlsx or .xls).")
+
+
+def match_import_columns(titles):
+    """Match header cells to the people fields. Returns {field: column index}."""
+    keys = [re.sub(r"[^a-z0-9]", "", title.lower()) for title in titles]
+    mapping = {}
+    for index, key in enumerate(keys):  # pass 1: exact header names (leftmost column wins)
+        if not key:
+            continue
+        for field, aliases in EXACT_HEADERS.items():
+            if key in aliases and field not in mapping:
+                mapping[field] = index
+                break
+    used = set(mapping.values())
+    for index, key in enumerate(keys):  # pass 2: header contains a known word
+        if not key or index in used or any(word in key for word in EXCLUDED_HEADER_WORDS):
+            continue
+        for field, words in KEYWORD_HEADERS:
+            if field not in mapping and any(word in key for word in words):
+                mapping[field] = index
+                used.add(index)
+                break
+    return mapping
+
+
+def has_required_columns(mapping):
+    has_name = "name" in mapping or ("last_name" in mapping and "first_name" in mapping)
+    return "school_id" in mapping and has_name
+
+
+def find_import_header(rows):
+    for position, (number, cells) in enumerate(rows[:MAX_HEADER_SCAN_ROWS]):
+        mapping = match_import_columns(cells)
+        if has_required_columns(mapping):
+            return number, mapping, cells, rows[position + 1:]
+    return None
+
+
+@app.post("/api/people/import")
+@roles_required("MIS Admin")
+def import_people():
+    upload = request.files.get("file")
+    if not upload or not upload.filename:
+        return api_error("Choose an Excel file (.xlsx or .xls) to upload.")
+    if not upload.filename.lower().endswith((".xlsx", ".xls")):
+        return api_error("Only Excel files (.xlsx or .xls) can be imported.")
+    content = upload.read(MAX_COVER_SIZE + 1)
+    if len(content) > MAX_COVER_SIZE:
+        return api_error("The uploaded file is larger than the 5 MB limit.", 413)
+    try:
+        sheets = read_spreadsheet_sheets(content)
+    except (ValueError, ET.ParseError) as error:
+        return api_error(str(error) if isinstance(error, ValueError) else "This Excel file could not be read.")
+
+    found = None
+    sheet_name = ""
+    for sheet_name, rows in sheets:
+        found = find_import_header(rows)
+        if found:
+            break
+    if not found:
+        return api_error(
+            "Could not find the people columns in this file. A header row needs a School ID column "
+            "(ID No., Student ID...) and a Name column (or First Name and Last Name). "
+            "Role, Department / Program, Contact and Status are optional. "
+            "Sheets checked: " + ", ".join(name for name, _ in sheets) + "."
+        )
+    header_row, columns, header_cells, data_rows = found
+
+    def cell(cells, field):
+        index = columns.get(field)
+        return cells[index] if index is not None and index < len(cells) else ""
+
+    def person_name(cells):
+        if "name" in columns:
+            return tidy(cell(cells, "name"))
+        given = tidy(" ".join(part for part in (cell(cells, "first_name"), cell(cells, "middle_name"),
+                                                 cell(cells, "suffix")) if part))
+        last = tidy(cell(cells, "last_name"))
+        return f"{last}, {given}" if last and given else (last or given)
+
+    data_rows = [(number, cells) for number, cells in data_rows if any(str(value).strip() for value in cells)]
+    if not data_rows:
+        return api_error("The Excel file has no people rows to import.")
+    if len(data_rows) > MAX_IMPORT_ROWS:
+        return api_error(f"Import up to {MAX_IMPORT_ROWS} rows at a time.")
+
+    used_columns = set(columns.values())
+    matched_columns = [
+        {"field": FIELD_LABELS[field], "column": header_cells[columns[field]]}
+        for field in FIELD_LABELS if field in columns
+    ]
+    ignored_columns = [title for index, title in enumerate(header_cells)
+                       if title.strip() and index not in used_columns]
+
+    added = updated = unchanged = 0
+    errors = []
+    seen_ids = set()
+    with get_connection() as connection:
+        known_people = {
+            school_id_key(row["school_id"]): row
+            for row in connection.execute(
+                "SELECT id, school_id, name, role, person_type, department, contact, status FROM users"
+            )
+        }
+        for number, cells in data_rows:
+            raw_role = (tidy(cell(cells, "role")) if "role" in columns else "") or "Student"
+            record = {
+                "school_id": tidy(cell(cells, "school_id")),
+                "name": person_name(cells),
+                "role": PERSON_ROLES.get(raw_role.lower(), raw_role),
+                "department": tidy(cell(cells, "department")),
+                "contact": clean_contact(cell(cells, "contact")),
+                "status": import_status(tidy(cell(cells, "status"))),
+            }
+            try:
+                person = validate_person(record)
+            except ValueError as error:
+                errors.append({"row": number, "school_id": record["school_id"], "reason": str(error)})
+                continue
+            key = school_id_key(person["school_id"])
+            if not key:
+                errors.append({"row": number, "school_id": person["school_id"],
+                               "reason": "School ID must contain letters or numbers."})
+                continue
+            if key in seen_ids:
+                errors.append({"row": number, "school_id": person["school_id"],
+                               "reason": "Duplicate School ID in this file (first occurrence was used)."})
+                continue
+            seen_ids.add(key)
+
+            existing = known_people.get(key)
+            if existing:
+                if existing["role"] in ("MIS Admin", "Librarian"):
+                    errors.append({"row": number, "school_id": person["school_id"],
+                                   "reason": "This School ID belongs to a system account."})
+                    continue
+                current = (existing["name"], existing["person_type"] or existing["role"],
+                           existing["department"], existing["contact"], existing["status"])
+                incoming = (person["name"], person["person_role"], person["department"],
+                            person["contact"], person["status"])
+                if current == incoming:
+                    unchanged += 1
+                    continue
+                # Face image / encoding are intentionally left untouched.
+                connection.execute(
+                    """UPDATE users SET name = ?, role = ?, person_type = ?, department = ?,
+                       contact = ?, status = ? WHERE id = ?""",
+                    (person["name"], person["role"], person["person_role"], person["department"],
+                     person["contact"], person["status"], existing["id"]),
+                )
+                if person["status"] == "inactive" and existing["status"] != "inactive":
+                    connection.execute(
+                        """UPDATE attendance_records SET time_out = ?, status = 'admin_closed'
+                           WHERE person_id = ? AND time_out IS NULL""",
+                        (manila_now(), existing["id"]),
+                    )
+                updated += 1
+                continue
+            email = person["school_id"].lower() + "@paterostechnologicalcollege.edu.ph"
+            try:
+                connection.execute(
+                    """INSERT INTO users
+                       (school_id, name, email, role, person_type, department, contact, status)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (person["school_id"], person["name"], email, person["role"], person["person_role"],
+                     person["department"], person["contact"], person["status"]),
+                )
+                added += 1
+            except sqlite3.IntegrityError:
+                errors.append({"row": number, "school_id": person["school_id"],
+                               "reason": "This School ID or its generated email is already in use."})
+
+    return jsonify({
+        "added": added,
+        "updated": updated,
+        "unchanged": unchanged,
+        "skipped": len(errors),
+        "errors": errors[:MAX_IMPORT_ERRORS_SHOWN],
+        "more_errors": max(0, len(errors) - MAX_IMPORT_ERRORS_SHOWN),
+        "sheet": sheet_name,
+        "matched_columns": matched_columns,
+        "ignored_columns": ignored_columns,
+        "message": "Excel import finished. Face images are not imported; upload them manually in People Information.",
+    })
+
+
+@app.get("/api/people/lookup")
+@roles_required("MIS Admin")
+def lookup_person():
+    school_id = request.args.get("school_id", "").strip()
+    if not school_id or not school_id_key(school_id):
+        return api_error("Enter a School ID.")
+    with get_connection() as connection:
+        row = connection.execute(
+            f"""SELECT id, school_id, name, role AS account_role, {person_role_expression()} AS role,
+                       department, contact, status,
+                       CASE WHEN face_image = '' THEN 0 ELSE 1 END AS has_face_image,
+                       CASE WHEN face_encoding = '' THEN 0 ELSE 1 END AS face_registered
+                FROM users WHERE {SQL_SCHOOL_ID_KEY} = ?""",
+            (school_id_key(school_id),),
+        ).fetchone()
+    if not row:
+        return jsonify({"person": None})
+    person = dict(row)
+    if person.pop("account_role") in ("MIS Admin", "Librarian"):
+        return jsonify({"person": None, "system_account": True})
+    return jsonify({"person": person})
+
+
 @app.delete("/api/people/<int:person_id>")
 @roles_required("MIS Admin")
 def deactivate_person(person_id):
@@ -1492,31 +1952,97 @@ def uploaded_face_extension(image_data):
     return cover_extension(image_data)
 
 
+def write_file_durably(path, data):
+    """Write to a temp file, flush to disk, then rename so a crash never leaves a partial image."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".part")
+    with open(temporary, "wb") as output:
+        output.write(data)
+        output.flush()
+        os.fsync(output.fileno())
+    temporary.replace(path)
+
+
 def save_person_face(person_id, upload):
+    """Save the image permanently and register the face encoding in the same request.
+
+    Returns (result, error). result["registered"] is False only when the recognition
+    engine is unavailable on the server; the camera station then registers it as before.
+    """
     image_data = upload.stream.read(MAX_COVER_SIZE + 1)
     if len(image_data) > MAX_COVER_SIZE:
         return None, api_error("Face images must be 5 MB or smaller.", 413)
     extension = uploaded_face_extension(image_data)
     if not extension:
         return None, api_error("Choose a valid PNG, JPEG, GIF, or WebP image.")
-    FACE_DIRECTORY.mkdir(parents=True, exist_ok=True)
+
+    with get_connection() as connection:
+        person = connection.execute("SELECT role FROM users WHERE id = ?", (person_id,)).fetchone()
+    if not person or person["role"] in ("MIS Admin", "Librarian"):
+        return None, api_error("People record not found.", 404)
+
+    encoding_json = ""
+    try:
+        encoding = face_enrollment.encode_face_image(image_data)
+        encoding_json = json.dumps(encoding, separators=(",", ":"))
+    except face_enrollment.FaceImageError as error:
+        return None, api_error(str(error), 422)
+    except face_enrollment.FaceEngineUnavailable as error:
+        app.logger.warning("Server-side face registration unavailable: %s", error)
+
     filename = secrets.token_hex(16) + extension
-    (FACE_DIRECTORY / filename).write_bytes(image_data)
+    image_path = FACE_DIRECTORY / filename
+    try:
+        write_file_durably(image_path, image_data)
+    except OSError:
+        app.logger.exception("Could not store face image")
+        return None, api_error("The face image could not be stored on the server. Please try again.", 500)
     with get_connection() as connection:
         person = connection.execute(
             "SELECT face_image, role FROM users WHERE id = ?", (person_id,)
         ).fetchone()
         if not person or person["role"] in ("MIS Admin", "Librarian"):
-            (FACE_DIRECTORY / filename).unlink(missing_ok=True)
+            image_path.unlink(missing_ok=True)
             return None, api_error("People record not found.", 404)
         connection.execute(
-            "UPDATE users SET face_image = ?, face_encoding = '' WHERE id = ?",
-            (filename, person_id),
+            "UPDATE users SET face_image = ?, face_encoding = ? WHERE id = ?",
+            (filename, encoding_json, person_id),
         )
     old_filename = person["face_image"]
     if old_filename and Path(old_filename).name == old_filename:
         (FACE_DIRECTORY / old_filename).unlink(missing_ok=True)
-    return filename, None
+    return {"filename": filename, "registered": bool(encoding_json)}, None
+
+
+def register_pending_faces_on_server():
+    """Register stored face images that have no encoding yet (e.g. uploaded before this update)."""
+    try:
+        with get_connection() as connection:
+            rows = connection.execute(
+                """SELECT id, face_image FROM users
+                   WHERE face_image != '' AND face_encoding = ''
+                     AND role NOT IN ('MIS Admin', 'Librarian')"""
+            ).fetchall()
+        for row in rows:
+            if Path(row["face_image"]).name != row["face_image"]:
+                continue
+            image_path = FACE_DIRECTORY / row["face_image"]
+            if not image_path.is_file():
+                continue
+            try:
+                encoding = face_enrollment.encode_face_image(image_path.read_bytes())
+            except face_enrollment.FaceImageError as error:
+                app.logger.info("Face for person %s not registered: %s", row["id"], error)
+                continue
+            with get_connection() as connection:
+                connection.execute(
+                    "UPDATE users SET face_encoding = ? WHERE id = ? AND face_image = ? AND face_encoding = ''",
+                    (json.dumps(encoding, separators=(",", ":")), row["id"], row["face_image"]),
+                )
+    except face_enrollment.FaceEngineUnavailable as error:
+        app.logger.warning("Pending face registration skipped: %s", error)
+    except Exception:
+        app.logger.exception("Pending face registration failed")
 
 
 @app.post("/api/people/<int:person_id>/face")
@@ -1525,10 +2051,15 @@ def upload_person_face(person_id):
     upload = request.files.get("face_image")
     if not upload:
         return api_error("Choose a face image to upload.")
-    _, error = save_person_face(person_id, upload)
+    result, error = save_person_face(person_id, upload)
     if error:
         return error
-    return jsonify({"message": "Face image saved. Face registration is pending IoT processing."})
+    if result["registered"]:
+        return jsonify({"message": "Face image saved and face registration completed.", "face_registered": True})
+    return jsonify({
+        "message": "Face image saved. Face registration is pending IoT processing.",
+        "face_registered": False,
+    })
 
 
 @app.get("/api/people/<int:person_id>/face-image")
@@ -1708,6 +2239,13 @@ def iot_face_templates():
     return jsonify({"people": templates})
 
 
+@app.get("/healthz")
+def health_check():
+    with get_connection() as connection:
+        connection.execute("SELECT 1").fetchone()
+    return jsonify({"status": "ok"})
+
+
 @app.get("/")
 def welcome_page():
     return send_from_directory(PROJECT_ROOT, "welcome.html")
@@ -1716,8 +2254,9 @@ def welcome_page():
 @app.route("/<path:requested_path>", methods=["GET", "HEAD"])
 def frontend_files(requested_path):
     lower_path = requested_path.lower()
-    if (lower_path.startswith((".", "backend/", "face_recognition_iot/"))
-            or lower_path.startswith("smart_library.db")):
+    if (lower_path.startswith((".", "backend/", "face_recognition_iot/", "uploads/", "models/"))
+            or lower_path.startswith("smart_library.db")
+            or lower_path in {"render.yaml", "requirements.txt", "build.sh", "runtime.txt"}):
         abort(404)
     file_path = (PROJECT_ROOT / requested_path).resolve()
     if not file_path.is_relative_to(PROJECT_ROOT) or not file_path.is_file():
@@ -1745,7 +2284,15 @@ def handle_database_error(error):
 
 @app.errorhandler(413)
 def handle_large_upload(error):
-    return api_error("Book images must be 5 MB or smaller.", 413)
+    return api_error("The uploaded file is larger than the 5 MB limit.", 413)
+
+
+def start_pending_face_registration():
+    import threading
+    threading.Thread(target=register_pending_faces_on_server, name="face-backfill", daemon=True).start()
+
+
+start_pending_face_registration()
 
 
 if __name__ == "__main__":

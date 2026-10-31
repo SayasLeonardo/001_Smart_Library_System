@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: smart-library
+    runtime: python
+    plan: starter            # persistent disks require a paid instance
+    region: singapore        # closest Render region to the Philippines
+    buildCommand: pip install -r requirements.txt && python backend/face_enrollment.py
+    startCommand: gunicorn --chdir backend app:app --workers 1 --threads 4 --timeout 120 --bind 0.0.0.0:$PORT
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: SMART_LIBRARY_DATA_DIR
+        value: /var/data
+      - key: SMART_LIBRARY_SECRET
+        generateValue: true
+      - key: SMART_LIBRARY_IOT_KEY
+        generateValue: true
+    disk:
+      name: smart-library-data
+      mountPath: /var/data
+      sizeGB: 5

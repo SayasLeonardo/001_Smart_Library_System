@@ -19,14 +19,21 @@ class SmartLibraryApi:
             data = json.dumps(body).encode("utf-8")
         request = Request(self.base_url + path, data=data, headers=headers, method=method)
         try:
-            with urlopen(request, timeout=15) as response:
+            with urlopen(request, timeout=30) as response:
                 result = response.read()
         except HTTPError as error:
             detail = error.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"Library API returned {error.code}: {detail}") from error
         except URLError as error:
             raise RuntimeError(f"Cannot connect to the Smart Library API: {error.reason}") from error
-        return result if binary else json.loads(result.decode("utf-8"))
+        except OSError as error:  # read timeouts / dropped connections (e.g. while Render restarts)
+            raise RuntimeError(f"Cannot reach the Smart Library API: {error}") from error
+        if binary:
+            return result
+        try:
+            return json.loads(result.decode("utf-8"))
+        except ValueError as error:
+            raise RuntimeError("The Smart Library API returned an unexpected response.") from error
 
     def register_pending_faces(self, recognizer):
         pending = self._request("/api/iot/face-enrollments")["people"]

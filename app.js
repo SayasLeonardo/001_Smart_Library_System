@@ -3,6 +3,8 @@
   "use strict";
 
   const API = "/api";
+  const INSTITUTIONAL_EMAIL_DOMAIN = "@paterostechnologicalcollege.edu.ph";
+  const INSTITUTIONAL_EMAIL_PATTERN = /^[A-Za-z0-9._%+-]+@paterostechnologicalcollege\.edu\.ph$/i;
   let currentUser = null;
   let books = [];
   let transactions = [];
@@ -491,7 +493,7 @@
     dueDate.setDate(dueDate.getDate() + 14);
     showDialog("Borrow Book", [
       { name: "borrower_school_id", label: "School ID", required: true, value: "" },
-      { name: "institutional_email", label: "Institutional Email", type: "email", required: true, value: "" },
+      { name: "institutional_email", label: "Institutional Email", type: "email", required: true, value: "", placeholder: "yourname@paterostechnologicalcollege.edu.ph" },
       { name: "borrower_name", label: "Borrower's Name", readonly: true, value: "" },
       { name: "borrower_department", label: "Course / Program", readonly: true, value: "" },
       { name: "book_number", label: "Book Number", readonly: true, value: book.book_number },
@@ -501,7 +503,11 @@
       { name: "borrow_date", label: "Borrow Date", readonly: true, value: new Date().toISOString().slice(0, 10) },
       { name: "due_date", label: "Due Date", type: "date", value: dueDate.toISOString().slice(0, 10), required: true }
     ], book.title, "Confirm Borrow", async function (values) {
-      const matches = await request("/borrowers?q=" + encodeURIComponent(values.borrower_school_id.trim()));
+      const typedEmail = values.institutional_email.trim();
+      if (!INSTITUTIONAL_EMAIL_PATTERN.test(typedEmail)) {
+        throw new Error("The institutional email must end with " + INSTITUTIONAL_EMAIL_DOMAIN + ".");
+      }
+      const matches = await request("/borrowers?exact=1&q=" + encodeURIComponent(values.borrower_school_id.trim()));
       const borrower = matches.borrowers.find(function (item) {
         return item.school_id.toLowerCase() === values.borrower_school_id.trim().toLowerCase();
       });
@@ -510,7 +516,7 @@
         method: "POST",
         body: JSON.stringify({
           borrower_school_id: borrower.school_id,
-          institutional_email: values.institutional_email.trim(),
+          institutional_email: typedEmail,
           barcode: values.barcode.trim(),
           due_date: values.due_date
         })
@@ -521,24 +527,96 @@
       const form = dialog.querySelector("form");
       const context = dialog.querySelector("p");
       const schoolId = form.elements.borrower_school_id;
+      const emailInput = form.elements.institutional_email;
+      const nameInput = form.elements.borrower_name;
+      const programInput = form.elements.borrower_department;
       const barcodeInput = form.elements.barcode;
-      async function loadBorrower() {
-        const schoolIdValue = schoolId.value.trim();
-        if (!schoolIdValue) return;
-        const matches = await request("/borrowers?q=" + encodeURIComponent(schoolIdValue));
-        const borrower = matches.borrowers.find(function (item) {
-          return item.school_id.toLowerCase() === schoolIdValue.toLowerCase();
-        });
-        if (!borrower) throw new Error("No active student or faculty member has that school ID.");
-        form.elements.institutional_email.value = borrower.email;
-        form.elements.borrower_name.value = borrower.name;
-        form.elements.borrower_department.value = borrower.department;
-        if (context) context.textContent = "Borrower: " + borrower.name + " · " + borrower.department;
+
+      function addStatusLine(input) {
+        const line = document.createElement("small");
+        line.setAttribute("aria-live", "polite");
+        line.style.cssText = "display:block;margin-top:4px;font-size:12px;min-height:16px;";
+        input.closest(".dialog-field").appendChild(line);
+        return function (message, kind) {
+          line.textContent = message || "";
+          line.style.color = kind === "error" ? "#B3261E" : kind === "ok" ? "#1E7A3E" : "#5B7466";
+        };
       }
+      const setIdStatus = addStatusLine(schoolId);
+      const setEmailStatus = addStatusLine(emailInput);
+
+      function clearBorrower() {
+        nameInput.value = "";
+        programInput.value = "";
+        if (context) context.textContent = "";
+      }
+
+      // ---- Institutional Email: typed by the librarian / MIS staff, never auto-filled ----
+      function checkEmail() {
+        const value = emailInput.value.trim();
+        if (!value) {
+          emailInput.setCustomValidity("");
+          setEmailStatus("");
+        } else if (!INSTITUTIONAL_EMAIL_PATTERN.test(value)) {
+          const message = "Email must end with " + INSTITUTIONAL_EMAIL_DOMAIN;
+          emailInput.setCustomValidity(message);
+          setEmailStatus(message, "error");
+        } else {
+          emailInput.setCustomValidity("");
+          setEmailStatus("Valid institutional email.", "ok");
+        }
+      }
+      emailInput.addEventListener("input", checkEmail);
+      emailInput.addEventListener("blur", checkEmail);
+
+      // ---- School ID: looks up the saved record and fills Name + Course / Program ----
+      let lookupTimer = null;
+      let lookupSeq = 0;
+
+      async function loadBorrower() {
+        const idValue = schoolId.value.trim();
+        const seq = ++lookupSeq;
+        if (!idValue) {
+          clearBorrower();
+          setIdStatus("");
+          return;
+        }
+        setIdStatus("Looking up borrower...", "info");
+        let matches;
+        try {
+          matches = await request("/borrowers?exact=1&q=" + encodeURIComponent(idValue));
+        } catch (error) {
+          if (seq === lookupSeq) { clearBorrower(); setIdStatus(error.message, "error"); }
+          return;
+        }
+        if (seq !== lookupSeq) return; // a newer lookup is already running
+
+        const borrower = matches.borrowers.find(function (item) {
+          return item.school_id.toLowerCase() === idValue.toLowerCase();
+        });
+        if (!borrower) {
+          clearBorrower();
+          setIdStatus("No active student or faculty member has that school ID.", "error");
+          return;
+        }
+        nameInput.value = borrower.name;
+        programInput.value = borrower.department || "";
+        if (context) context.textContent = "Borrower: " + borrower.name + " · " + (borrower.department || "");
+        setIdStatus("Borrower found: " + borrower.name + " (" + borrower.role + ")", "ok");
+      }
+
+      function scheduleLookup(delay) {
+        clearTimeout(lookupTimer);
+        lookupTimer = setTimeout(function () { loadBorrower(); }, delay);
+      }
+
+      schoolId.addEventListener("input", function () { scheduleLookup(400); });
+      schoolId.addEventListener("change", function () { scheduleLookup(0); });
+      schoolId.addEventListener("blur", function () { scheduleLookup(0); });
       schoolId.addEventListener("keydown", function (event) {
         if (event.key !== "Enter") return;
         event.preventDefault();
-        loadBorrower().catch(function (error) { notify(error.message, true); });
+        scheduleLookup(0);
       });
       barcodeInput.addEventListener("keydown", function (event) {
         if (event.key !== "Enter") return;
@@ -774,7 +852,8 @@
       return '<option value="' + status + '"' + ((person && String(person.status).toLowerCase() === status) ? " selected" : "") + ">" + label + "</option>";
     }).join("");
     dialog.innerHTML = '<form><h2>' + (person ? "Edit People Information" : "Add People Information") +
-      '</h2><div class="dialog-field"><label>School ID<input name="school_id" required maxlength="50" value="' + escapeHtml(person && person.school_id) + '"></label></div>' +
+      '</h2><div class="dialog-field"><label>School ID<input name="school_id" required maxlength="50" autocomplete="off" value="' + escapeHtml(person && person.school_id) + '"></label>' +
+      (person ? "" : '<small class="person-lookup-status" aria-live="polite"></small>') + '</div>' +
       '<div class="dialog-field"><label>Full Name<input name="name" required maxlength="200" value="' + escapeHtml(person && person.name) + '"></label></div>' +
       '<div class="dialog-field"><label>Role<select name="role" required>' + roleOptions + '</select></label></div>' +
       '<div class="dialog-field"><label>Department<input name="department" maxlength="100" value="' + escapeHtml(person && person.department) + '"></label></div>' +
@@ -786,9 +865,91 @@
     document.body.appendChild(dialog);
     dialog.addEventListener("close", function () { dialog.remove(); });
     dialog.querySelector("[data-cancel]").addEventListener("click", function () { dialog.close(); });
+    // ---- Automatic information detection (Add mode only) ----
+    // Typing a School ID looks it up in the database and fills in the saved details.
+    // If the person already exists (for example, imported from Excel), saving updates that record.
+    let matched = null;
+    let lastLookedUpId = "";
+    let lookupTimer = null;
+    let lookupSeq = 0;
+    const personForm = dialog.querySelector("form");
+    const lookupStatus = dialog.querySelector(".person-lookup-status");
+    const submitButton = personForm.querySelector('button[type="submit"]');
+    const heading = personForm.querySelector("h2");
+
+    function setLookupStatus(message, kind) {
+      if (!lookupStatus) return;
+      lookupStatus.textContent = message || "";
+      lookupStatus.style.cssText = "font-size:12px;min-height:16px;color:" +
+        (kind === "error" ? "#B3261E" : kind === "ok" ? "#1E7A3E" : "#5B7466");
+    }
+    function applyMatch(found) {
+      matched = found;
+      personForm.elements.name.value = found ? found.name : "";
+      personForm.elements.role.value = found ? found.role : "Student";
+      personForm.elements.department.value = found ? (found.department || "") : "";
+      personForm.elements.contact.value = found ? (found.contact || "") : "";
+      personForm.elements.status.value = found ? String(found.status).toLowerCase() : "active";
+      heading.textContent = found ? "Update People Information" : "Add People Information";
+      submitButton.textContent = found ? "Update Information" : "Save Information";
+    }
+    async function lookupSchoolId() {
+      const typedId = personForm.elements.school_id.value.trim();
+      const seq = ++lookupSeq;
+      lastLookedUpId = typedId;
+      if (!typedId) {
+        if (matched) applyMatch(null);
+        setLookupStatus("");
+        return;
+      }
+      setLookupStatus("Looking up School ID...", "info");
+      let result;
+      try {
+        result = await request("/people/lookup?school_id=" + encodeURIComponent(typedId));
+      } catch (error) {
+        if (seq === lookupSeq) setLookupStatus(error.message, "error");
+        return;
+      }
+      if (seq !== lookupSeq) return;
+      if (result.person) {
+        applyMatch(result.person);
+        personForm.elements.school_id.value = result.person.school_id;
+        lastLookedUpId = result.person.school_id;
+        setLookupStatus("Existing record found: " + result.person.name + ". Details filled in; saving will update this record." +
+          (result.person.has_face_image ? " A face image is already uploaded; choosing a new one replaces it." : ""), "ok");
+      } else {
+        if (matched) applyMatch(null);
+        setLookupStatus(result.system_account ? "This School ID belongs to a system account, not a person record."
+                                              : "No saved record for this School ID. Enter the details to add a new person.",
+                        result.system_account ? "error" : "info");
+      }
+    }
+    if (!person) {
+      const idField = personForm.elements.school_id;
+      idField.addEventListener("input", function () {
+        clearTimeout(lookupTimer);
+        lookupTimer = setTimeout(lookupSchoolId, 400);
+      });
+      idField.addEventListener("blur", function () { clearTimeout(lookupTimer); lookupSchoolId(); });
+      idField.addEventListener("keydown", function (event) {
+        if (event.key !== "Enter") return;
+        event.preventDefault();
+        clearTimeout(lookupTimer);
+        lookupSchoolId();
+      });
+    }
+
     dialog.querySelector("form").addEventListener("submit", async function (event) {
       event.preventDefault();
       const form = event.currentTarget;
+      if (!person && form.elements.school_id.value.trim() !== lastLookedUpId) {
+        await lookupSchoolId();
+        if (matched) {
+          notify("An existing record was found and loaded. Review the details, then save again.");
+          return;
+        }
+      }
+      const target = person || matched;
       const values = new FormData(form);
       const image = values.get("face_image");
       const payload = {
@@ -800,20 +961,59 @@
         status: values.get("status")
       };
       try {
-        const result = await request(person ? "/people/" + person.id : "/people", {
-          method: person ? "PUT" : "POST", body: JSON.stringify(payload)
+        const result = await request(target ? "/people/" + target.id : "/people", {
+          method: target ? "PUT" : "POST", body: JSON.stringify(payload)
         });
-        const personId = person ? person.id : result.id;
+        const personId = target ? target.id : result.id;
+        let faceResult = null;
+        let faceError = null;
         if (image && image.size) {
           const upload = new FormData();
           upload.append("face_image", image);
-          await request("/people/" + personId + "/face", { method: "POST", body: upload });
+          try {
+            faceResult = await request("/people/" + personId + "/face", { method: "POST", body: upload });
+          } catch (error) { faceError = error; }
         }
         dialog.close();
-        notify(image && image.size ? "People information and face image saved. Face registration is pending IoT processing." : result.message);
+        if (faceError) {
+          notify("People information saved, but the face image was not registered: " + faceError.message, true);
+        } else if (faceResult) {
+          notify("People information saved. " + faceResult.message);
+        } else {
+          notify(result.message);
+        }
         await loadManagedRecords("people", managedSearchText, managedRoleFilter);
       } catch (error) { notify(error.message, true); }
     });
+    dialog.showModal();
+  }
+
+  function showImportResult(result) {
+    const dialog = document.createElement("dialog");
+    dialog.className = "api-dialog people-dialog import-result-dialog";
+    const errors = (result.errors || []).map(function (item) {
+      return "<li>Row " + escapeHtml(String(item.row)) + (item.school_id ? " (" + escapeHtml(item.school_id) + ")" : "") +
+        ": " + escapeHtml(item.reason) + "</li>";
+    }).join("");
+    dialog.innerHTML = '<form method="dialog"><h2>Excel Import Complete</h2>' +
+      '<ul class="import-summary">' +
+      "<li><strong>" + result.added + "</strong> added</li>" +
+      "<li><strong>" + result.updated + "</strong> updated</li>" +
+      "<li><strong>" + result.unchanged + "</strong> unchanged</li>" +
+      "<li><strong>" + result.skipped + "</strong> skipped</li></ul>" +
+      (result.matched_columns && result.matched_columns.length
+        ? '<h3 class="import-columns-title">Columns matched automatically' + (result.sheet ? " (sheet: " + escapeHtml(result.sheet) + ")" : "") + '</h3><ul class="import-columns">' +
+          result.matched_columns.map(function (item) {
+            return "<li><strong>" + escapeHtml(item.field) + "</strong> &larr; " + escapeHtml(item.column) + "</li>";
+          }).join("") + "</ul>" : "") +
+      (result.ignored_columns && result.ignored_columns.length
+        ? '<p class="import-ignored">Ignored columns: ' + escapeHtml(result.ignored_columns.join(", ")) + "</p>" : "") +
+      "<p>Face images are not imported. Upload them manually: enter the School ID in Add People Information (or use Edit) and choose the image.</p>" +
+      (errors ? '<h3 class="import-errors-title">Rows that were skipped</h3><ul class="import-errors">' + errors +
+        (result.more_errors ? "<li>...and " + result.more_errors + " more.</li>" : "") + "</ul>" : "") +
+      '<div class="api-dialog-actions"><button type="submit">Close</button></div></form>';
+    document.body.appendChild(dialog);
+    dialog.addEventListener("close", function () { dialog.remove(); });
     dialog.showModal();
   }
 
@@ -892,6 +1092,9 @@
     const systemTab = document.getElementById("viewSystemUsers");
     const peopleTab = document.getElementById("viewPeopleInformation");
     const roleFilter = document.getElementById("systemRoleFilter");
+    const importButton = document.getElementById("importPeopleButton");
+    const importFile = document.getElementById("importPeopleFile");
+    const importHint = document.getElementById("importPeopleHint");
     function setView(view) {
       managedView = view;
       managedRoleFilter = view === "system" && roleFilter ? roleFilter.value : "";
@@ -905,6 +1108,8 @@
         peopleTab.setAttribute("aria-selected", String(view === "people"));
       }
       if (roleFilter) roleFilter.hidden = view !== "system";
+      if (importButton) importButton.hidden = view !== "people";
+      if (importHint) importHint.hidden = view !== "people";
       if (add) add.textContent = view === "system" ? "ADD SYSTEM USER" : "ADD PEOPLE INFORMATION";
       loadManagedRecords(view, managedSearchText, roleFilter ? roleFilter.value : "").catch(function (error) {
         notify(error.message, true);
@@ -924,6 +1129,33 @@
         notify(error.message, true);
       });
     });
+    if (importButton && importFile) {
+      importButton.addEventListener("click", function () { importFile.click(); });
+      importFile.addEventListener("change", async function () {
+        const file = importFile.files && importFile.files[0];
+        importFile.value = "";
+        if (!file) return;
+        if (!/\.(xlsx|xls)$/i.test(file.name)) {
+          notify("Choose an Excel file (.xlsx or .xls).", true);
+          return;
+        }
+        const label = importButton.innerHTML;
+        importButton.disabled = true;
+        importButton.textContent = "IMPORTING...";
+        try {
+          const upload = new FormData();
+          upload.append("file", file);
+          const result = await request("/people/import", { method: "POST", body: upload });
+          await loadManagedRecords("people", managedSearchText, managedRoleFilter);
+          showImportResult(result);
+        } catch (error) {
+          notify(error.message, true);
+        } finally {
+          importButton.disabled = false;
+          importButton.innerHTML = label;
+        }
+      });
+    }
     if (add) add.addEventListener("click", function () {
       if (managedView === "system") showSystemUserForm(null);
       else showPersonForm(null);

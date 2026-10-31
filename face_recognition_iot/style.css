@@ -89,9 +89,10 @@ body {
 
 .camera-frame {
   position: relative;
-  width: 100%;
-  height: min(48vh, 440px);
-  min-height: 280px;
+  width: min(100%, 420px);
+  aspect-ratio: 3 / 4;
+  max-height: 64vh;
+  margin: 0 auto;
   overflow: hidden;
   display: grid;
   place-items: center;
@@ -192,7 +193,7 @@ body {
   .brand-copy p { font-size: 12px; }
   .station-status { gap: 5px; font-size: 10px; }
   .section-heading { align-items: flex-start; flex-direction: column; }
-  .camera-frame { height: 38vh; min-height: 220px; }
+  .camera-frame { width: min(100%, 300px); max-height: 56vh; }
   .mode-group { gap: 8px; }
   .mode-button { min-height: 58px; font-size: 14px; }
   .person-details { grid-template-columns: 1fr 1fr; }

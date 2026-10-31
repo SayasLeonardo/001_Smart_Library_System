@@ -258,3 +258,71 @@ tbody tr:hover { background: rgba(34, 67, 50, 0.03); }
   .main { padding: 16px; }
   .search-box { width: 100%; }
 }
+
+/* ---------- 7. People Excel Import ---------- */
+.btn-import-people {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: #FFFFFF;
+  color: var(--btn-add-text);
+  border: 1.5px solid var(--stage-border);
+  border-radius: 16px;
+  padding: 5px 16px;
+  font-size: 12px;
+  font-weight: 800;
+  cursor: pointer;
+}
+.btn-import-people:hover { background: var(--btn-add-bg); }
+.btn-import-people:disabled { opacity: .6; cursor: wait; }
+.btn-import-people[hidden], .import-hint[hidden] { display: none; }
+
+.import-hint {
+  margin: 0 0 10px;
+  text-align: right;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--ink-soft);
+}
+
+.import-summary {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  margin: 0 0 14px;
+  padding: 0;
+  list-style: none;
+}
+.import-summary li {
+  background: var(--btn-add-bg);
+  color: var(--btn-add-text);
+  border-radius: 6px;
+  padding: 8px 6px;
+  text-align: center;
+  font-size: 12px;
+  font-weight: 600;
+}
+.import-summary strong { display: block; font-size: 20px; }
+.import-errors-title { margin: 14px 0 6px; font-size: 13px; color: #A82F2F; }
+.import-errors {
+  max-height: 200px;
+  overflow: auto;
+  margin: 0;
+  padding: 8px 8px 8px 24px;
+  border: 1px solid var(--row-border);
+  border-radius: 4px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.import-columns-title { margin: 12px 0 6px; font-size: 13px; color: var(--ink); }
+.import-columns {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px 12px;
+  margin: 0 0 8px;
+  padding: 0;
+  list-style: none;
+  font-size: 12px;
+}
+.import-ignored { margin: 0 0 8px; font-size: 12px; color: var(--ink-soft); }
