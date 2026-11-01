@@ -8,8 +8,8 @@ import os
 import re
 import secrets
 import io
+import mimetypes
 import posixpath
-import sqlite3
 import zipfile
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta
@@ -23,10 +23,16 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
 
 try:
-    from database import DATA_DIR, DATABASE_PATH, get_connection, initialize_database
+    from database import (
+        DATA_DIR, DATABASE_PATH, DatabaseError, IntegrityError, USING_POSTGRES,
+        get_connection, initialize_database,
+    )
     import face_enrollment
 except ModuleNotFoundError:  # pragma: no cover - supports running from repo root
-    from backend.database import DATA_DIR, DATABASE_PATH, get_connection, initialize_database
+    from backend.database import (
+        DATA_DIR, DATABASE_PATH, DatabaseError, IntegrityError, USING_POSTGRES,
+        get_connection, initialize_database,
+    )
     from backend import face_enrollment
 
 
@@ -37,6 +43,9 @@ UPLOAD_ROOT = (DATA_DIR / "uploads") if DATA_DIR else (Path(__file__).resolve().
 COVER_DIRECTORY = UPLOAD_ROOT / "book_covers"
 FACE_DIRECTORY = UPLOAD_ROOT / "person_faces"
 IS_RENDER = os.environ.get("RENDER") == "true"
+# With PostgreSQL, uploaded images are stored in the database (Render's free web service has
+# no permanent disk). Without it, they stay on disk exactly as before.
+STORE_FILES_IN_DATABASE = USING_POSTGRES
 MAX_COVER_SIZE = 5 * 1024 * 1024
 MANILA_TIME = ZoneInfo("Asia/Manila")
 app = Flask(__name__)
@@ -60,6 +69,66 @@ initialize_database()
 
 def api_error(message, status=400):
     return jsonify({"error": message}), status
+
+
+# --- Uploaded image storage -------------------------------------------------------------
+# kind is "cover" (book covers) or "face" (people face images).
+def _store_directory(kind):
+    return COVER_DIRECTORY if kind == "cover" else FACE_DIRECTORY
+
+
+def store_file(kind, filename, data):
+    if STORE_FILES_IN_DATABASE:
+        content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        with get_connection() as connection:
+            connection.execute(
+                """INSERT INTO stored_files (kind, name, content_type, data) VALUES (?, ?, ?, ?)
+                   ON CONFLICT (kind, name) DO UPDATE SET data = excluded.data,
+                   content_type = excluded.content_type""",
+                (kind, filename, content_type, data),
+            )
+    else:
+        write_file_durably(_store_directory(kind) / filename, data)
+
+
+def read_stored_file(kind, filename):
+    """Return (bytes, content_type) or None when the file does not exist."""
+    if Path(filename).name != filename:
+        return None
+    if STORE_FILES_IN_DATABASE:
+        with get_connection() as connection:
+            row = connection.execute(
+                "SELECT data, content_type FROM stored_files WHERE kind = ? AND name = ?", (kind, filename)
+            ).fetchone()
+        if not row:
+            return None
+        return bytes(row["data"]), row["content_type"]
+    path = _store_directory(kind) / filename
+    if not path.is_file():
+        return None
+    return path.read_bytes(), mimetypes.guess_type(filename)[0] or "application/octet-stream"
+
+
+def delete_stored_file(kind, filename):
+    if not filename or Path(filename).name != filename:
+        return
+    if STORE_FILES_IN_DATABASE:
+        with get_connection() as connection:
+            connection.execute("DELETE FROM stored_files WHERE kind = ? AND name = ?", (kind, filename))
+    else:
+        (_store_directory(kind) / filename).unlink(missing_ok=True)
+
+
+def stored_file_response(kind, filename):
+    if STORE_FILES_IN_DATABASE:
+        found = read_stored_file(kind, filename)
+        if not found:
+            abort(404)
+        response = Response(found[0], mimetype=found[1])
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+    return send_from_directory(_store_directory(kind), filename, max_age=0)
+
 
 
 def signed_in_user():
@@ -693,7 +762,7 @@ def list_books():
                       CASE WHEN available_quantity > 0 THEN 'Available' ELSE 'Not Available' END AS status
                FROM books WHERE status = 'active'
                  AND (book_number LIKE ? OR barcode LIKE ? OR title LIKE ? OR author LIKE ? OR category LIKE ?)
-               ORDER BY title COLLATE NOCASE""",
+               ORDER BY lower(title)""",
             (search, search, search, search, search),
         ).fetchall()
     return jsonify({"books": [dict(row) for row in rows]})
@@ -774,7 +843,7 @@ def get_book_cover(book_id):
         ).fetchone()
     if not book or not book["cover_image"]:
         abort(404)
-    return send_from_directory(COVER_DIRECTORY, book["cover_image"], max_age=0)
+    return stored_file_response("cover", book["cover_image"])
 
 
 @app.post("/api/books/<int:book_id>/cover")
@@ -797,20 +866,16 @@ def upload_book_cover(book_id):
     if not book:
         return api_error("Book not found.", 404)
 
-    COVER_DIRECTORY.mkdir(parents=True, exist_ok=True)
     filename = secrets.token_hex(16) + extension
-    image_path = COVER_DIRECTORY / filename
-    image_path.write_bytes(image_data)
+    store_file("cover", filename, image_data)
     try:
         with get_connection() as connection:
             connection.execute("UPDATE books SET cover_image = ? WHERE id = ?", (filename, book_id))
     except Exception:
-        image_path.unlink(missing_ok=True)
+        delete_stored_file("cover", filename)
         raise
 
-    old_filename = book["cover_image"]
-    if old_filename and Path(old_filename).name == old_filename:
-        (COVER_DIRECTORY / old_filename).unlink(missing_ok=True)
+    delete_stored_file("cover", book["cover_image"])
     return jsonify({"message": "Book image updated.", "cover_image": filename})
 
 
@@ -824,9 +889,7 @@ def reset_book_cover(book_id):
         if not book:
             return api_error("Book not found.", 404)
         connection.execute("UPDATE books SET cover_image = '' WHERE id = ?", (book_id,))
-    old_filename = book["cover_image"]
-    if old_filename and Path(old_filename).name == old_filename:
-        (COVER_DIRECTORY / old_filename).unlink(missing_ok=True)
+    delete_stored_file("cover", book["cover_image"])
     return jsonify({"message": "Book image reset to the default."})
 
 
@@ -855,7 +918,7 @@ def create_book():
                 (book_number, barcode, title, author, category, published_date, quantity, quantity),
             )
         return jsonify({"id": cursor.lastrowid, "message": "Book added."}), 201
-    except sqlite3.IntegrityError:
+    except IntegrityError:
         with get_connection() as connection:
             if connection.execute("SELECT 1 FROM books WHERE barcode = ?", (data.get("barcode"),)).fetchone():
                 return api_error("This barcode is already assigned to another book.", 409)
@@ -893,7 +956,7 @@ def update_book(book_id):
         return jsonify({"message": "Book updated."})
     except (ValueError, TypeError) as error:
         return api_error(str(error))
-    except sqlite3.IntegrityError:
+    except IntegrityError:
         if "barcode" in values:
             with get_connection() as connection:
                 if connection.execute("SELECT 1 FROM books WHERE barcode = ? AND id != ?",
@@ -928,7 +991,7 @@ def find_borrowers():
                 """SELECT id, school_id, name, email, role, department FROM users
                    WHERE status = 'active' AND role IN ('Student', 'Faculty')
                    AND LOWER(school_id) = LOWER(?)
-                   ORDER BY name COLLATE NOCASE LIMIT 20""",
+                   ORDER BY lower(name) LIMIT 20""",
                 (term,),
             ).fetchall()
         else:
@@ -937,7 +1000,7 @@ def find_borrowers():
                 """SELECT id, school_id, name, email, role, department FROM users
                    WHERE status = 'active' AND role IN ('Student', 'Faculty')
                    AND (school_id LIKE ? OR name LIKE ? OR email LIKE ?)
-                   ORDER BY name COLLATE NOCASE LIMIT 20""",
+                   ORDER BY lower(name) LIMIT 20""",
                 (search, search, search),
             ).fetchall()
     return jsonify({"borrowers": [dict(row) for row in rows]})
@@ -1014,7 +1077,7 @@ def borrow_book():
             )
             connection.execute("UPDATE books SET available_quantity = available_quantity - 1 WHERE id = ?", (book["id"],))
         return jsonify({"message": "Book borrowed."}), 201
-    except sqlite3.IntegrityError:
+    except IntegrityError:
         return api_error("Unable to create the transaction.", 409)
 
 
@@ -1084,7 +1147,7 @@ def book_activity_rows(overdue_only=False):
     if overdue_only:
         sql += " AND date(t.due_date) < ?"
         parameters.append(today)
-    sql += " ORDER BY t.due_date, borrower_name COLLATE NOCASE"
+    sql += " ORDER BY t.due_date, lower(COALESCE(NULLIF(t.borrower_name, ''), u.name, ''))"
     with get_connection() as connection:
         return [dict(row) for row in connection.execute(sql, parameters).fetchall()]
 
@@ -1229,7 +1292,7 @@ def list_users():
             """SELECT id, school_id, name, email, role, department, status, created_at
                FROM users WHERE role IN ('MIS Admin', 'Librarian')
                AND (school_id LIKE ? OR name LIKE ? OR email LIKE ? OR role LIKE ?)
-               ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, name COLLATE NOCASE""",
+               ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, lower(name)""",
             (search, search, search, search),
         ).fetchall()
     return jsonify({"users": [dict(row) for row in rows]})
@@ -1275,7 +1338,7 @@ def create_user():
         return jsonify({"id": cursor.lastrowid, "message": "User added."}), 201
     except (ValueError, TypeError) as error:
         return api_error(str(error))
-    except sqlite3.IntegrityError:
+    except IntegrityError:
         return api_error("School ID or email is already in use.", 409)
 
 
@@ -1322,7 +1385,7 @@ def update_user(user_id):
         return jsonify({"message": "User updated."})
     except (ValueError, TypeError) as error:
         return api_error(str(error))
-    except sqlite3.IntegrityError:
+    except IntegrityError:
         return api_error("School ID or email is already in use.", 409)
 
 
@@ -1419,7 +1482,7 @@ def list_people():
                 WHERE role NOT IN ('MIS Admin', 'Librarian')
                   AND (school_id LIKE ? OR name LIKE ? OR department LIKE ? OR {person_role_expression()} LIKE ?)
                   AND (? = '' OR {person_role_expression()} = ?)
-                ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, name COLLATE NOCASE""",
+                ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, lower(name)""",
             (search, search, search, search, person_role, person_role),
         ).fetchall()
     return jsonify({"people": [dict(row) for row in rows]})
@@ -1443,7 +1506,7 @@ def create_person():
         return jsonify({"id": cursor.lastrowid, "message": "People information saved."}), 201
     except (ValueError, TypeError) as error:
         return api_error(str(error))
-    except sqlite3.IntegrityError:
+    except IntegrityError:
         return api_error("That School ID is already registered.", 409)
 
 
@@ -1475,7 +1538,7 @@ def update_person(person_id):
         return jsonify({"message": "People information updated."})
     except (ValueError, TypeError) as error:
         return api_error(str(error))
-    except sqlite3.IntegrityError:
+    except IntegrityError:
         return api_error("That School ID is already registered.", 409)
 
 
@@ -1870,7 +1933,7 @@ def import_people():
                      person["department"], person["contact"], person["status"]),
                 )
                 added += 1
-            except sqlite3.IntegrityError:
+            except IntegrityError:
                 errors.append({"row": number, "school_id": person["school_id"],
                                "reason": "This School ID or its generated email is already in use."})
 
@@ -1943,8 +2006,7 @@ def permanently_delete_person(person_id):
             return api_error("Deactivate the person before permanently deleting the record.", 409)
         if not delete_user_preserving_history(connection, person_id):
             return api_error("People record not found.", 404)
-    if person["face_image"] and Path(person["face_image"]).name == person["face_image"]:
-        (FACE_DIRECTORY / person["face_image"]).unlink(missing_ok=True)
+    delete_stored_file("face", person["face_image"])
     return jsonify({"message": "People information permanently deleted."})
 
 
@@ -1991,10 +2053,9 @@ def save_person_face(person_id, upload):
         app.logger.warning("Server-side face registration unavailable: %s", error)
 
     filename = secrets.token_hex(16) + extension
-    image_path = FACE_DIRECTORY / filename
     try:
-        write_file_durably(image_path, image_data)
-    except OSError:
+        store_file("face", filename, image_data)
+    except (OSError, *DatabaseError):
         app.logger.exception("Could not store face image")
         return None, api_error("The face image could not be stored on the server. Please try again.", 500)
     with get_connection() as connection:
@@ -2002,15 +2063,13 @@ def save_person_face(person_id, upload):
             "SELECT face_image, role FROM users WHERE id = ?", (person_id,)
         ).fetchone()
         if not person or person["role"] in ("MIS Admin", "Librarian"):
-            image_path.unlink(missing_ok=True)
+            delete_stored_file("face", filename)
             return None, api_error("People record not found.", 404)
         connection.execute(
             "UPDATE users SET face_image = ?, face_encoding = ? WHERE id = ?",
             (filename, encoding_json, person_id),
         )
-    old_filename = person["face_image"]
-    if old_filename and Path(old_filename).name == old_filename:
-        (FACE_DIRECTORY / old_filename).unlink(missing_ok=True)
+    delete_stored_file("face", person["face_image"])
     return {"filename": filename, "registered": bool(encoding_json)}, None
 
 
@@ -2024,13 +2083,11 @@ def register_pending_faces_on_server():
                      AND role NOT IN ('MIS Admin', 'Librarian')"""
             ).fetchall()
         for row in rows:
-            if Path(row["face_image"]).name != row["face_image"]:
-                continue
-            image_path = FACE_DIRECTORY / row["face_image"]
-            if not image_path.is_file():
+            stored = read_stored_file("face", row["face_image"])
+            if not stored:
                 continue
             try:
-                encoding = face_enrollment.encode_face_image(image_path.read_bytes())
+                encoding = face_enrollment.encode_face_image(stored[0])
             except face_enrollment.FaceImageError as error:
                 app.logger.info("Face for person %s not registered: %s", row["id"], error)
                 continue
@@ -2069,7 +2126,7 @@ def get_person_face(person_id):
         person = connection.execute("SELECT face_image FROM users WHERE id = ?", (person_id,)).fetchone()
     if not person or not person["face_image"]:
         abort(404)
-    return send_from_directory(FACE_DIRECTORY, person["face_image"], max_age=0)
+    return stored_file_response("face", person["face_image"])
 
 
 @app.delete("/api/people/<int:person_id>/face")
@@ -2080,8 +2137,7 @@ def reset_person_face(person_id):
         if not person or person["role"] in ("MIS Admin", "Librarian"):
             return api_error("People record not found.", 404)
         connection.execute("UPDATE users SET face_image = '', face_encoding = '' WHERE id = ?", (person_id,))
-    if person["face_image"] and Path(person["face_image"]).name == person["face_image"]:
-        (FACE_DIRECTORY / person["face_image"]).unlink(missing_ok=True)
+    delete_stored_file("face", person["face_image"])
     return jsonify({"message": "Face image and recognition data removed."})
 
 
@@ -2097,7 +2153,7 @@ def list_system_users():
             """SELECT id, school_id, name, email, role, department, status, created_at, last_login_at
                FROM users WHERE role IN ('MIS Admin', 'Librarian')
                AND (? = '' OR role = ?) AND (name LIKE ? OR email LIKE ? OR school_id LIKE ?)
-               ORDER BY role, name COLLATE NOCASE""",
+               ORDER BY role, lower(name)""",
             (role, role, search, search, search),
         ).fetchall()
     return jsonify({"users": [dict(row) for row in rows]})
@@ -2121,7 +2177,7 @@ def create_system_user():
         return jsonify({"id": cursor.lastrowid, "message": "System account added."}), 201
     except (ValueError, TypeError) as error:
         return api_error(str(error))
-    except sqlite3.IntegrityError:
+    except IntegrityError:
         return api_error("School ID or email is already in use.", 409)
 
 
@@ -2188,7 +2244,7 @@ def iot_person_face_image(person_id):
         ).fetchone()
     if not person or not person["face_image"]:
         abort(404)
-    return send_from_directory(FACE_DIRECTORY, person["face_image"], max_age=0)
+    return stored_file_response("face", person["face_image"])
 
 
 @app.put("/api/iot/people/<int:person_id>/face-encoding")
@@ -2276,10 +2332,13 @@ def frontend_files(requested_path):
     return send_from_directory(PROJECT_ROOT, requested_path)
 
 
-@app.errorhandler(sqlite3.Error)
 def handle_database_error(error):
     app.logger.exception("Database request failed: %s", error)
     return jsonify({"error": "A database error occurred. Please try again."}), 500
+
+
+for _database_error in DatabaseError:
+    app.register_error_handler(_database_error, handle_database_error)
 
 
 @app.errorhandler(413)

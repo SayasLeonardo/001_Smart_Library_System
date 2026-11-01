@@ -1,7 +1,18 @@
-"""SQLite setup and starter records for the Smart Library System."""
+"""Database setup and starter records for the Smart Library System.
 
+Two backends are supported:
+  * PostgreSQL when the DATABASE_URL environment variable is set (used on Render).
+  * SQLite otherwise (local development, unchanged behaviour).
+
+The application's SQL is written in SQLite style. For PostgreSQL it is translated at
+run time by `translate_sql`, so the queries in app.py work on both backends.
+"""
+
+import functools
 import os
+import re
 import sqlite3
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -21,8 +32,199 @@ else:
     DATABASE_PATH = Path(__file__).resolve().parent.parent / "smart_library.db"
 
 
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+USING_POSTGRES = bool(DATABASE_URL)
+
+if USING_POSTGRES:
+    import psycopg
+    from psycopg_pool import ConnectionPool
+
+    IntegrityError = (sqlite3.IntegrityError, psycopg.errors.IntegrityError)
+    DatabaseError = (sqlite3.Error, psycopg.Error)
+else:
+    IntegrityError = (sqlite3.IntegrityError,)
+    DatabaseError = (sqlite3.Error,)
+
+
+# ---------------------------------------------------------------------------------------
+# PostgreSQL compatibility layer
+# ---------------------------------------------------------------------------------------
+_NOW_UTC = "to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')"
+_NOW_MANILA = "to_char(now() AT TIME ZONE 'Asia/Manila', 'YYYY-MM-DD HH24:MI:SS')"
+_TABLES_WITH_ID = {
+    "users", "books", "book_transactions", "attendance_records",
+    "password_recovery_requests", "password_recovery_audit",
+}
+_ADVISORY_LOCK_KEY = 727001  # replaces SQLite's "BEGIN IMMEDIATE" single-writer behaviour
+
+
+class Row:
+    """Result row that supports row["name"], row[0], dict(row) and iteration, like sqlite3.Row."""
+
+    __slots__ = ("_names", "_values")
+
+    def __init__(self, names, values):
+        self._names = names
+        self._values = values
+
+    def __getitem__(self, key):
+        if isinstance(key, (int, slice)):
+            return self._values[key]
+        try:
+            return self._values[self._names.index(key)]
+        except ValueError:
+            raise IndexError(f"No item with that key: {key!r}") from None
+
+    def keys(self):
+        return list(self._names)
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __len__(self):
+        return len(self._values)
+
+    def __repr__(self):
+        return f"Row({dict(zip(self._names, self._values))!r})"
+
+
+def _row_factory(cursor):
+    names = [column.name for column in (cursor.description or [])]
+
+    def make_row(values):
+        return Row(names, tuple(values))
+
+    return make_row
+
+
+@functools.lru_cache(maxsize=1024)
+def translate_sql(sql):
+    """Translate one SQLite-style statement to PostgreSQL.
+
+    Returns (postgres_sql, kind) where kind is "lock", "insert" or "other".
+    """
+    stripped = sql.strip().rstrip(";").strip()
+    if stripped.upper() == "BEGIN IMMEDIATE":
+        return f"SELECT pg_advisory_xact_lock({_ADVISORY_LOCK_KEY})", "lock"
+
+    text = sql
+    text = re.sub(
+        r"datetime\(\s*'now'\s*,\s*'localtime'\s*\)", lambda _m: _NOW_MANILA, text, flags=re.IGNORECASE
+    )
+    text = re.sub(r"datetime\(\s*'now'\s*\)", lambda _m: _NOW_UTC, text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"CAST\(\s*julianday\(\?\)\s*-\s*julianday\(\s*date\(\s*([\w.]+)\s*\)\s*\)\s*AS\s+INTEGER\s*\)",
+        r"CAST(CAST(? AS DATE) - CAST(NULLIF(\1, '') AS DATE) AS INTEGER)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"\bdate\(\s*([\w.]+)\s*\)", r"CAST(NULLIF(\1, '') AS DATE)", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bLIKE\b", "ILIKE", text, flags=re.IGNORECASE)
+    text = text.replace(
+        "DO UPDATE SET attempts = attempts + 1",
+        "DO UPDATE SET attempts = password_recovery_rate_limits.attempts + 1",
+    )
+    text = text.replace("%", "%%").replace("?", "%s")
+
+    kind = "other"
+    insert = re.match(r"\s*INSERT\s+INTO\s+(\w+)", text, flags=re.IGNORECASE)
+    if insert:
+        kind = "insert"
+        if insert.group(1).lower() in _TABLES_WITH_ID and "RETURNING" not in text.upper():
+            text = text.rstrip().rstrip(";") + " RETURNING id"
+    return text, kind
+
+
+class PgCursor:
+    def __init__(self, cursor, lastrowid=None):
+        self._cursor = cursor
+        self.lastrowid = lastrowid
+
+    @property
+    def rowcount(self):
+        return self._cursor.rowcount
+
+    def fetchone(self):
+        return self._cursor.fetchone() if self._cursor.description else None
+
+    def fetchall(self):
+        return self._cursor.fetchall() if self._cursor.description else []
+
+    def __iter__(self):
+        return iter(self.fetchall())
+
+
+class PgConnection:
+    """Gives a psycopg connection the small sqlite3-style API that app.py relies on."""
+
+    def __init__(self, raw):
+        self._raw = raw
+
+    def execute(self, sql, params=()):
+        statement, kind = translate_sql(sql)
+        values = tuple(params or ())
+        if kind != "insert":
+            cursor = self._raw.cursor()
+            cursor.execute(statement, values)
+            return PgCursor(cursor)
+
+        # SQLite lets a failed INSERT be caught and the transaction continue; PostgreSQL
+        # aborts the whole transaction unless the statement is wrapped in a savepoint.
+        # Savepoint commands use their own cursor so they cannot discard this result.
+        guard = self._raw.cursor()
+        guard.execute("SAVEPOINT statement_guard")
+        cursor = self._raw.cursor()
+        try:
+            cursor.execute(statement, values)
+        except Exception:
+            guard.execute("ROLLBACK TO SAVEPOINT statement_guard")
+            raise
+        lastrowid = None
+        if statement.endswith("RETURNING id"):
+            row = cursor.fetchone()
+            lastrowid = row[0] if row else None
+        guard.execute("RELEASE SAVEPOINT statement_guard")
+        return PgCursor(cursor, lastrowid)
+
+    def executemany(self, sql, sequence):
+        for params in sequence:
+            self.execute(sql, params)
+
+    def execute_native(self, statement):
+        """Run PostgreSQL-native SQL (schema setup) without translation."""
+        self._raw.cursor().execute(statement)
+
+
+_pool = None
+_pool_lock = threading.Lock()
+
+
+def _get_pool():
+    global _pool
+    if _pool is None:
+        with _pool_lock:
+            if _pool is None:
+                _pool = ConnectionPool(
+                    DATABASE_URL,
+                    min_size=1,
+                    max_size=int(os.environ.get("SMART_LIBRARY_DB_POOL", "5")),
+                    kwargs={"row_factory": _row_factory, "connect_timeout": 10},
+                    check=ConnectionPool.check_connection,
+                    timeout=30,
+                    open=True,
+                )
+    return _pool
+
+
 @contextmanager
-def get_connection():
+def _postgres_connection():
+    # The pool commits when the block ends normally and rolls back on an exception.
+    with _get_pool().connection() as raw:
+        yield PgConnection(raw)
+
+
+@contextmanager
+def _sqlite_connection():
     connection = sqlite3.connect(DATABASE_PATH, timeout=30)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
@@ -36,6 +238,10 @@ def get_connection():
         raise
     finally:
         connection.close()
+
+
+def get_connection():
+    return _postgres_connection() if USING_POSTGRES else _sqlite_connection()
 
 
 # Optional starter catalog. Each entry is (book_number, title, author, category, published_date, quantity).
@@ -99,7 +305,171 @@ def seed_required_staff_accounts(connection):
                 ),
             )
 
+
+def _postgres_schema():
+    now = f"(({_NOW_UTC}))"
+    return [
+        f"""CREATE TABLE IF NOT EXISTS users (
+            id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+            school_id TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            email TEXT NOT NULL UNIQUE,
+            password_hash TEXT,
+            role TEXT NOT NULL CHECK (role IN ('MIS Admin', 'Librarian', 'Student', 'Faculty')),
+            department TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+            created_at TEXT NOT NULL DEFAULT {now},
+            person_type TEXT NOT NULL DEFAULT '',
+            contact TEXT NOT NULL DEFAULT '',
+            face_image TEXT NOT NULL DEFAULT '',
+            face_encoding TEXT NOT NULL DEFAULT '',
+            last_login_at TEXT
+        )""",
+        f"""CREATE TABLE IF NOT EXISTS books (
+            id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+            book_number TEXT NOT NULL UNIQUE,
+            barcode TEXT NOT NULL UNIQUE,
+            title TEXT NOT NULL,
+            author TEXT NOT NULL,
+            category TEXT NOT NULL,
+            published_date TEXT NOT NULL DEFAULT '',
+            quantity INTEGER NOT NULL CHECK (quantity >= 0),
+            available_quantity INTEGER NOT NULL CHECK (available_quantity >= 0),
+            cover_image TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'archived')),
+            created_at TEXT NOT NULL DEFAULT {now}
+        )""",
+        f"""CREATE TABLE IF NOT EXISTS book_transactions (
+            id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+            book_id INTEGER NOT NULL REFERENCES books(id),
+            borrower_id INTEGER REFERENCES users(id),
+            processed_by INTEGER REFERENCES users(id),
+            borrower_school_id TEXT NOT NULL DEFAULT '',
+            borrower_name TEXT NOT NULL DEFAULT '',
+            borrower_department TEXT NOT NULL DEFAULT '',
+            processor_school_id TEXT NOT NULL DEFAULT '',
+            processor_name TEXT NOT NULL DEFAULT '',
+            processor_department TEXT NOT NULL DEFAULT '',
+            barcode TEXT NOT NULL DEFAULT '',
+            institutional_email TEXT NOT NULL DEFAULT '',
+            borrow_date TEXT NOT NULL,
+            due_date TEXT NOT NULL,
+            return_date TEXT,
+            status TEXT NOT NULL DEFAULT 'borrowed' CHECK (status IN ('borrowed', 'returned')),
+            created_at TEXT NOT NULL DEFAULT {now}
+        )""",
+        f"""CREATE TABLE IF NOT EXISTS attendance_records (
+            id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+            person_id INTEGER REFERENCES users(id),
+            person_school_id TEXT NOT NULL DEFAULT '',
+            person_name TEXT NOT NULL DEFAULT '',
+            person_role TEXT NOT NULL DEFAULT '',
+            person_department TEXT NOT NULL DEFAULT '',
+            time_in TEXT NOT NULL,
+            time_out TEXT,
+            attendance_date TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'face_recognition',
+            status TEXT NOT NULL DEFAULT 'inside' CHECK (status IN ('inside', 'completed', 'admin_closed')),
+            created_at TEXT NOT NULL DEFAULT {now}
+        )""",
+        f"""CREATE TABLE IF NOT EXISTS password_recovery_requests (
+            id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+            user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            email TEXT NOT NULL,
+            code_hash TEXT NOT NULL,
+            token_hash TEXT,
+            reset_token_hash TEXT,
+            verify_attempts INTEGER NOT NULL DEFAULT 0,
+            verified_at TEXT,
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending', 'approved', 'rejected', 'expired', 'completed')),
+            requested_at TEXT NOT NULL DEFAULT {now},
+            expires_at TEXT NOT NULL,
+            approved_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            approved_at TEXT,
+            reviewed_at TEXT,
+            used_at TEXT,
+            created_at TEXT NOT NULL DEFAULT {now}
+        )""",
+        """CREATE TABLE IF NOT EXISTS password_recovery_audit (
+            id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+            request_id INTEGER REFERENCES password_recovery_requests(id) ON DELETE SET NULL,
+            actor_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            action TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS password_recovery_rate_limits (
+            action TEXT NOT NULL,
+            key_hash TEXT NOT NULL,
+            window_start TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (action, key_hash, window_start)
+        )""",
+        # Uploaded images live in the database because Render's free web service has no
+        # permanent disk.
+        f"""CREATE TABLE IF NOT EXISTS stored_files (
+            kind TEXT NOT NULL,
+            name TEXT NOT NULL,
+            content_type TEXT NOT NULL DEFAULT '',
+            data BYTEA NOT NULL,
+            created_at TEXT NOT NULL DEFAULT {now},
+            PRIMARY KEY (kind, name)
+        )""",
+        """CREATE UNIQUE INDEX IF NOT EXISTS one_active_recovery_request_per_user
+            ON password_recovery_requests(user_id) WHERE status IN ('pending', 'approved')""",
+        "CREATE INDEX IF NOT EXISTS recovery_requests_email_idx ON password_recovery_requests(email, status, expires_at)",
+        """CREATE UNIQUE INDEX IF NOT EXISTS one_open_attendance_per_person
+            ON attendance_records(person_id) WHERE time_out IS NULL AND person_id IS NOT NULL""",
+        "CREATE INDEX IF NOT EXISTS attendance_time_in_date ON attendance_records(time_in)",
+    ]
+
+
+def _seed_starter_records(connection):
+    user_count = connection.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    if user_count == 0:
+        users = [
+            ("MIS-001", "PTC MIS", "mis@paterostechnologicalcollege.edu.ph", "admin123", "MIS Admin", "MIS"),
+            ("LIB-001", "PTC Librarian", "librarian@paterostechnologicalcollege.edu.ph", "librarian123", "Librarian", "Library"),
+        ]
+        for school_id, name, email, password, role, department in users:
+            password_hash = generate_password_hash(password) if password else None
+            connection.execute(
+                """INSERT INTO users (school_id, name, email, password_hash, role, department)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (school_id, name, email, password_hash, role, department),
+            )
+
+    seed_required_staff_accounts(connection)
+
+    book_count = connection.execute("SELECT COUNT(*) FROM books").fetchone()[0]
+    if book_count == 0 and SEED_BOOKS:
+        connection.executemany(
+            """INSERT INTO books
+               (book_number, barcode, title, author, category, published_date, quantity, available_quantity)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            [
+                (book[0], f"SL{index:010d}", *book[1:], book[-1])
+                for index, book in enumerate(SEED_BOOKS, start=1)
+            ],
+        )
+
+
+def _initialize_postgres():
+    with get_connection() as connection:
+        # Serialise start-up so two instances deploying at once cannot race on the schema.
+        connection.execute_native("SELECT pg_advisory_xact_lock(727000)")
+        for statement in _postgres_schema():
+            connection.execute_native(statement)
+        _seed_starter_records(connection)
+
+
 def initialize_database():
+    if USING_POSTGRES:
+        _initialize_postgres()
+        return
+    _initialize_sqlite()
+
+def _initialize_sqlite():
     with get_connection() as connection:
         connection.execute("PRAGMA foreign_keys = OFF")
         connection.executescript(
@@ -450,30 +820,4 @@ def initialize_database():
         )
         connection.execute("CREATE INDEX IF NOT EXISTS attendance_time_in_date ON attendance_records(time_in)")
 
-        user_count = connection.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        if user_count == 0:
-            users = [
-                ("MIS-001", "PTC MIS", "mis@paterostechnologicalcollege.edu.ph", "admin123", "MIS Admin", "MIS"),
-                ("LIB-001", "PTC Librarian", "librarian@paterostechnologicalcollege.edu.ph", "librarian123", "Librarian", "Library"),
-            ]
-            for school_id, name, email, password, role, department in users:
-                password_hash = generate_password_hash(password) if password else None
-                connection.execute(
-                    """INSERT INTO users (school_id, name, email, password_hash, role, department)
-                       VALUES (?, ?, ?, ?, ?, ?)""",
-                    (school_id, name, email, password_hash, role, department),
-                )
-
-        seed_required_staff_accounts(connection)
-
-        book_count = connection.execute("SELECT COUNT(*) FROM books").fetchone()[0]
-        if book_count == 0 and SEED_BOOKS:
-            connection.executemany(
-                """INSERT INTO books
-                   (book_number, barcode, title, author, category, published_date, quantity, available_quantity)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                [
-                    (book[0], f"SL{index:010d}", *book[1:], book[-1])
-                    for index, book in enumerate(SEED_BOOKS, start=1)
-                ],
-            )
+        _seed_starter_records(connection)

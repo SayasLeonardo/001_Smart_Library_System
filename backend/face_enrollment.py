@@ -27,7 +27,7 @@ MODEL_URLS = {
     ),
 }
 MIN_MODEL_BYTES = 100_000  # guards against saving an HTML/LFS-pointer error page as a model
-MAX_SIDE = 1600
+MAX_SIDE = 1280  # keeps memory low on Render's free instance
 ENCODING_SIZE = 128
 
 
