@@ -58,8 +58,8 @@ def camera_worker():
     global LATEST_JPEG, PENDING_AT
     camera = None
     try:
-        api_url = os.environ.get("SMART_LIBRARY_API_URL", "http://127.0.0.1:5000")
-        api_key = os.environ.get("SMART_LIBRARY_IOT_KEY", "")
+        api_url = os.environ.get("SMART_LIBRARY_API_URL", "https://final-the-smart-library-system.onrender.com")
+        api_key = os.environ.get("SMART_LIBRARY_IOT_KEY", "4dd067e0d7f1b713db2614029ed2a3a0")
         if not api_key:
             raise RuntimeError("SMART_LIBRARY_IOT_KEY is not configured for this station.")
 
@@ -260,8 +260,8 @@ def confirm_attendance():
 
     try:
         library_api = SmartLibraryApi(
-            os.environ.get("SMART_LIBRARY_API_URL", "http://127.0.0.1:5000"),
-            os.environ.get("SMART_LIBRARY_IOT_KEY", ""),
+            os.environ.get("SMART_LIBRARY_API_URL", "https://final-the-smart-library-system.onrender.com"),
+            os.environ.get("SMART_LIBRARY_IOT_KEY", "4dd067e0d7f1b713db2614029ed2a3a0"),
         )
         saved = library_api.record_attendance(person, action.replace("_", "-"))
     except (RuntimeError, ValueError) as error:
