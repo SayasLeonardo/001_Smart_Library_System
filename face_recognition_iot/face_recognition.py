@@ -33,6 +33,7 @@ class FaceRecognizer:
         raise ValueError("Unsupported image format.")
 
     def encode(self, image):
+        """Detect exactly one face in the image and return its embedding."""
         image = self._as_bgr(image)
         faces = self.detector.detect(image)
         if not faces:
@@ -43,7 +44,15 @@ class FaceRecognizer:
             raise ValueError(
                 f"Detected {len(faces)} faces. Use an image containing only one person."
             )
-        aligned = self.recognizer.alignCrop(image, faces[0])
+        return self.encode_face(image, faces[0])
+
+    def encode_face(self, image, face):
+        """Embed a face that detector.detect() already found (skips a second detection).
+
+        Pass the original, unmodified frame: draw boxes and labels only afterwards.
+        """
+        image = self._as_bgr(image)
+        aligned = self.recognizer.alignCrop(image, face)
         embedding = self.recognizer.feature(aligned).reshape(-1).astype(np.float32)
         norm = np.linalg.norm(embedding)
         if norm == 0:
