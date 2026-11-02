@@ -139,12 +139,12 @@ body {
 .logout:hover { background: var(--sidebar-hover); }
 
 /* ---------- 4. Main & Top Controls ---------- */
-.main { padding: 20px 24px 26px; }
+.main { min-width: 0; padding: 20px 24px 26px; }
 
 .head {
   display: flex;
   justify-content: space-between;
-  align-items: flex-center;
+  align-items: flex-start;
   gap: 20px;
   flex-wrap: wrap;
   margin-bottom: 18px;
@@ -176,6 +176,32 @@ h1 { margin: 0; font-size: 26px; font-weight: 800; letter-spacing: -.02em; color
 .search-box input::placeholder { color: #7B8E83; }
 .search-box { width: min(520px, 100%); }
 .search-box input { min-width: 100px; }
+.book-catalog-controls {
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+}
+.book-catalog-controls .search-box { width: min(520px, 100%); }
+.book-filter-controls { display: flex; gap: 8px; }
+.book-filter {
+  display: grid;
+  gap: 3px;
+  min-width: 145px;
+  color: var(--ink-soft);
+  font-size: 11px;
+  font-weight: 700;
+}
+.book-filter select {
+  width: 100%;
+  min-height: 34px;
+  padding: 5px 8px;
+  border: 1px solid #839789;
+  border-radius: 4px;
+  background: #fff;
+  color: #1e3f2e;
+  font: 13px Arial, sans-serif;
+}
 .scan-search-button,
 .barcode-actions button {
   border: 1px solid #224332;
@@ -236,6 +262,24 @@ h1 { margin: 0; font-size: 26px; font-weight: 800; letter-spacing: -.02em; color
   transition: background 0.15s ease;
 }
 .btn-add:hover { background: var(--btn-add-hover); }
+.table-header-actions { display: flex; align-items: center; gap: 8px; }
+.btn-import-books {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: #e8f1e9;
+  color: #224332;
+  border: 1px solid var(--grid-border);
+  border-radius: 16px;
+  padding: 6px 14px;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: .02em;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+.btn-import-books:hover { background: #dceade; }
+.btn-import-books:disabled { cursor: wait; opacity: .65; }
 
 /* ---------- 6. Full Grid Table Layout ---------- */
 .scroll {
@@ -273,10 +317,81 @@ h1 { margin: 0; font-size: 26px; font-weight: 800; letter-spacing: -.02em; color
 }
 
 .grid-table td.code { font-weight: 700; text-align: center; }
+.grid-table td.code > strong { display: block; }
+.grid-table td.code small {
+  display: block;
+  margin-top: 5px;
+  color: var(--ink-soft);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+.grid-table td.code .barcode-value {
+  display: block;
+  color: var(--ink);
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
 .grid-table td.center { text-align: center; }
 .grid-table td.bold { font-weight: 600; }
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px 9px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1.25;
+  white-space: nowrap;
+}
+.status-badge.available { background: #e4f2e7; border-color: #b7d8bd; color: #1e5c38; }
+.status-badge.unavailable { background: #fff0ed; border-color: #e6b9b2; color: #8b2f24; }
+.borrower-note { display: block; margin-top: 4px; color: var(--ink-soft); font-size: 11px; }
 
 .grid-table tbody tr:hover { background: rgba(34, 67, 50, 0.03); }
+
+.import-summary {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  margin: 0 0 14px;
+  padding: 0;
+  list-style: none;
+}
+.import-summary li {
+  background: #DFF3E4;
+  color: #1E5C38;
+  border-radius: 6px;
+  padding: 8px 6px;
+  text-align: center;
+  font-size: 12px;
+  font-weight: 600;
+}
+.import-summary strong { display: block; font-size: 20px; }
+.import-errors-title { margin: 14px 0 6px; font-size: 13px; color: #A82F2F; }
+.import-errors {
+  max-height: 200px;
+  overflow: auto;
+  margin: 0;
+  padding: 8px 8px 8px 24px;
+  border: 1px solid #c8d8cb;
+  border-radius: 4px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.import-columns-title { margin: 12px 0 6px; font-size: 13px; color: var(--ink); }
+.import-columns {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px 12px;
+  margin: 0 0 8px;
+  padding: 0;
+  list-style: none;
+  font-size: 12px;
+}
+.import-ignored { margin: 0 0 8px; font-size: 12px; color: var(--ink-soft); }
 
 /* ---------- 7. Book Details Modal ---------- */
 .modal-overlay {
@@ -368,8 +483,10 @@ h1 { margin: 0; font-size: 26px; font-weight: 800; letter-spacing: -.02em; color
 
 /* ---------- 8. Responsive ---------- */
 @media (max-width: 900px) {
-  .app { grid-template-columns: 1fr; }
+  .app { grid-template-columns: minmax(0, 1fr); }
+  .sidebar, .main { width: 100%; min-width: 0; }
   .sidebar { position: static; height: auto; }
+  .book-catalog-controls { min-width: 0; }
   .nav { flex-direction: row; overflow-x: auto; padding: 8px; }
   .nav a { white-space: nowrap; padding: 9px 12px; }
   .side-foot { display: flex; align-items: center; justify-content: space-between; }
@@ -379,6 +496,12 @@ h1 { margin: 0; font-size: 26px; font-weight: 800; letter-spacing: -.02em; color
 }
 
 @media (max-width: 640px) {
+  .book-catalog-controls { width: 100%; grid-template-columns: 1fr; }
+  .book-catalog-controls .search-box { width: 100%; }
+  .book-filter-controls { display: grid; grid-template-columns: 1fr 1fr; }
+  .book-filter { min-width: 0; }
+  .import-summary { grid-template-columns: repeat(2, 1fr); }
+  .import-columns { grid-template-columns: 1fr; }
   .modal { width: calc(100% - 24px); max-height: calc(100vh - 24px); overflow-y: auto; }
   .modal-grid { grid-template-columns: 1fr; }
   .book-cover img { max-width: 180px; display: block; margin: 0 auto; }
