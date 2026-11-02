@@ -58,8 +58,8 @@ def camera_worker():
     global LATEST_JPEG, PENDING_AT
     camera = None
     try:
-        api_url = os.environ.get("SMART_LIBRARY_API_URL", "https://final-the-smart-library-system.onrender.com")
-        api_key = os.environ.get("SMART_LIBRARY_IOT_KEY", "4dd067e0d7f1b713db2614029ed2a3a0")
+        api_url = os.environ.get("SMART_LIBRARY_API_URL", "https://smart-library-system-xthn.onrender.com")
+        api_key = os.environ.get("SMART_LIBRARY_IOT_KEY", "3563d09a6d37d2fa67f0f872dbad2e67")
         if not api_key:
             raise RuntimeError("SMART_LIBRARY_IOT_KEY is not configured for this station.")
 
