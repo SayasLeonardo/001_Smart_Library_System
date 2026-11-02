@@ -447,35 +447,84 @@
   function renderBooks() {
     const table = document.querySelector(".grid-table");
     if (!table) return;
+    const categoryFilter = document.getElementById("bookCategoryFilter");
+    const availabilityFilter = document.getElementById("bookAvailabilityFilter");
+    const selectedCategory = categoryFilter ? categoryFilter.value.toLowerCase() : "";
+    const selectedAvailability = availabilityFilter ? availabilityFilter.value : "";
+    const visibleBooks = books.filter(function (book) {
+      const available = Number(book.available_quantity) > 0;
+      return (!selectedCategory || String(book.category || "").toLowerCase() === selectedCategory) &&
+        (!selectedAvailability || (selectedAvailability === "available" ? available : !available));
+    });
     const countLabel = document.getElementById("book-count-label");
-    if (countLabel) {
-      countLabel.textContent = String(books.length);
-    }
-    const header = table.querySelector("thead tr");
-    if (header && !header.querySelector("th[data-actions]")) {
-      const actionHeader = document.createElement("th");
-      actionHeader.dataset.actions = "true";
-      actionHeader.textContent = "Actions";
-      header.appendChild(actionHeader);
-    }
+    if (countLabel) countLabel.textContent = String(visibleBooks.length);
     const tbody = table.querySelector("tbody");
-    tbody.innerHTML = books.length ? books.map(function (book) {
+    tbody.innerHTML = visibleBooks.length ? visibleBooks.map(function (book) {
       const borrowed = transactions.filter(function (item) { return item.book_id === book.id && item.status === "borrowed"; });
       const borrowerNames = borrowed.map(function (item) { return item.borrower_name; }).join(", ");
+      const available = Number(book.available_quantity) > 0;
       return '<tr data-book-id="' + book.id + '">' +
-        '<td class="code">' + escapeHtml(book.book_number) + '<br><small>Barcode: ' + escapeHtml(book.barcode) + '</small></td>' +
+        '<td class="code"><strong>' + escapeHtml(book.book_number) + '</strong>' +
+          '<small><span class="barcode-label">Barcode:</span><span class="barcode-value">' +
+          escapeHtml(book.barcode) + '</span></small></td>' +
         '<td>' + escapeHtml(book.category) + '</td>' +
-        '<td class="bold">' + escapeHtml(book.title) + '</td>' +
+        '<td class="book-title-cell">' + escapeHtml(book.title) + '</td>' +
         '<td>' + escapeHtml(book.author) + '</td>' +
         '<td class="center">' + escapeHtml(book.published_date) + '</td>' +
         '<td class="center">' + book.quantity + '</td>' +
         '<td class="center">' + book.available_quantity + '</td>' +
-        '<td class="bold">' + escapeHtml(book.status) + (borrowerNames ? '<br><small>' + escapeHtml(borrowerNames) + '</small>' : '') + '</td>' +
-        '<td class="book-actions"><button type="button" data-action="borrow" data-book-id="' + book.id + '">Borrow</button>' +
-        (borrowed.length ? '<button type="button" data-action="return" data-book-id="' + book.id + '">Return</button>' : '') +
-        '<button type="button" data-action="edit" data-book-id="' + book.id + '">Edit</button>' +
-        '<button type="button" data-action="delete" data-book-id="' + book.id + '">Remove</button></td></tr>';
-    }).join("") : '<tr><td colspan="9">No books match your search.</td></tr>';
+        '<td><span class="status-badge ' + (available ? "available" : "unavailable") + '">' +
+          (available ? "Available" : "Unavailable") + '</span>' +
+          (borrowerNames ? '<small class="borrower-note">Borrowed by ' + escapeHtml(borrowerNames) + '</small>' : '') + '</td>' +
+        '<td class="book-actions"><button class="action-button borrow-action" type="button" data-action="borrow" data-book-id="' + book.id +
+          '"' + (available ? "" : " disabled") + '>Borrow</button>' +
+        (borrowed.length ? '<button class="action-button return-action" type="button" data-action="return" data-book-id="' + book.id + '">Return</button>' : '') +
+        '<button class="action-button" type="button" data-action="edit" data-book-id="' + book.id + '">Edit</button>' +
+        '<button class="action-button remove-action" type="button" data-action="delete" data-book-id="' + book.id + '">Remove</button></td></tr>';
+    }).join("") : '<tr><td class="empty-catalog" colspan="9">' +
+      (books.length ? "No books match these filters." : "No books found. Try a different search or add a book.") + '</td></tr>';
+  }
+
+  function updateBookCategoryFilter() {
+    const filter = document.getElementById("bookCategoryFilter");
+    if (!filter) return;
+    const selected = filter.value;
+    const categories = Array.from(new Set(books.map(function (book) {
+      return String(book.category || "").trim();
+    }).filter(Boolean))).sort(function (left, right) { return left.localeCompare(right); });
+    filter.replaceChildren(new Option("All Categories", ""));
+    categories.forEach(function (category) { filter.add(new Option(category, category)); });
+    if (selected && !categories.includes(selected)) filter.add(new Option(selected, selected));
+    filter.value = selected;
+  }
+
+  function showBookImportResult(result) {
+    const dialog = document.createElement("dialog");
+    dialog.className = "api-dialog people-dialog import-result-dialog";
+    const errors = (result.errors || []).map(function (item) {
+      return "<li>Row " + escapeHtml(String(item.row)) +
+        (item.barcode ? " (" + escapeHtml(item.barcode) + ")" : "") +
+        ": " + escapeHtml(item.reason) + "</li>";
+    }).join("");
+    dialog.innerHTML = '<form method="dialog"><h2>Excel Import Complete</h2>' +
+      '<ul class="import-summary">' +
+      "<li><strong>" + result.added + "</strong> added</li>" +
+      "<li><strong>" + result.skipped + "</strong> skipped</li>" +
+      "<li><strong>" + (result.added + result.skipped) + "</strong> rows processed</li>" +
+      "<li><strong>" + (result.matched_columns || []).length + "</strong> columns matched</li></ul>" +
+      (result.matched_columns && result.matched_columns.length
+        ? '<h3 class="import-columns-title">Columns matched automatically' + (result.sheet ? " (sheet: " + escapeHtml(result.sheet) + ")" : "") + '</h3><ul class="import-columns">' + result.matched_columns.map(function (item) {
+          return "<li><strong>" + escapeHtml(item.field) + "</strong> &larr; " + escapeHtml(item.column) + "</li>";
+        }).join("") + "</ul>" : "") +
+      (result.ignored_columns && result.ignored_columns.length
+        ? '<p class="import-ignored">Ignored columns: ' + escapeHtml(result.ignored_columns.join(", ")) + "</p>" : "") +
+      "<p>Imported books are added to the catalog with all copies available. Borrowing transactions are not imported.</p>" +
+      (errors ? '<h3 class="import-errors-title">Rows that were skipped</h3><ul class="import-errors">' + errors +
+        (result.more_errors ? "<li>...and " + result.more_errors + " more.</li>" : "") + "</ul>" : "") +
+      '<div class="api-dialog-actions"><button type="submit">Close</button></div></form>';
+    document.body.appendChild(dialog);
+    dialog.addEventListener("close", function () { dialog.remove(); });
+    dialog.showModal();
   }
 
   async function refreshBooks(search) {
@@ -485,6 +534,7 @@
     ]);
     books = results[0].books;
     transactions = results[1].transactions;
+    updateBookCategoryFilter();
     renderBooks();
   }
 
@@ -728,9 +778,11 @@
         if (button.dataset.action === "return") await returnBook(book);
         if (button.dataset.action === "edit") setBookModal(book);
         if (button.dataset.action === "delete") {
-          showDialog("Remove Book", [], book.title, "Remove", async function () {
+          showDialog("Permanently Delete Book", [],
+            book.title + " and all its borrowing history will be permanently deleted. This cannot be undone.",
+            "Delete Permanently", async function () {
             await request("/books/" + book.id, { method: "DELETE" });
-            notify("Book removed from the catalog.");
+            notify("Book and its transaction history were permanently deleted.");
             await refreshBooks(search ? search.value : "");
           });
         }
@@ -738,6 +790,40 @@
     });
     const addButton = document.querySelector(".btn-add");
     if (addButton) addButton.addEventListener("click", function () { setBookModal(null); });
+    const categoryFilter = document.getElementById("bookCategoryFilter");
+    const availabilityFilter = document.getElementById("bookAvailabilityFilter");
+    if (categoryFilter) categoryFilter.addEventListener("change", renderBooks);
+    if (availabilityFilter) availabilityFilter.addEventListener("change", renderBooks);
+    const importButton = document.getElementById("importBooksButton");
+    const importFile = document.getElementById("importBooksFile");
+    if (importButton && importFile) {
+      importButton.addEventListener("click", function () { importFile.click(); });
+      importFile.addEventListener("change", async function () {
+        const file = importFile.files && importFile.files[0];
+        importFile.value = "";
+        if (!file) return;
+        if (!/\.(xlsx|xls)$/i.test(file.name)) {
+          notify("Choose an Excel file (.xlsx or .xls).", true);
+          return;
+        }
+        const label = importButton.innerHTML;
+        importButton.disabled = true;
+        importButton.textContent = "IMPORTING...";
+        try {
+          const upload = new FormData();
+          upload.append("file", file);
+          const result = await request("/books/import", { method: "POST", body: upload });
+          if (search) search.value = "";
+          await refreshBooks("");
+          showBookImportResult(result);
+        } catch (error) {
+          notify(error.message, true);
+        } finally {
+          importButton.disabled = false;
+          importButton.innerHTML = label;
+        }
+      });
+    }
     const modal = document.getElementById("bookModal");
     if (!modal) return;
     const close = modal.querySelector(".close-btn");
