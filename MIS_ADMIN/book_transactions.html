@@ -69,27 +69,42 @@
         <h1>Book Transactions</h1>
         <p class="sub">Book borrowing status</p>
       </div>
-
-      <div class="search-box">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-        <input type="text" id="searchInput" placeholder="Search or scan barcode">
-        <button type="button" class="scan-search-button" id="scanBookButton">Scan Barcode</button>
+      <div class="book-catalog-controls">
+        <div class="search-box">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          <input type="text" id="searchInput" placeholder="Search or scan barcode">
+          <button type="button" class="scan-search-button" id="scanBookButton">Scan Barcode</button>
+        </div>
+        <div class="book-filter-controls">
+          <label class="book-filter">Category
+            <select id="bookCategoryFilter" aria-label="Filter books by category">
+              <option value="">All Categories</option>
+            </select>
+          </label>
+          <label class="book-filter">Availability
+            <select id="bookAvailabilityFilter" aria-label="Filter books by availability">
+              <option value="">All Books</option>
+              <option value="available">Available</option>
+              <option value="unavailable">Unavailable</option>
+            </select>
+          </label>
+        </div>
       </div>
     </div>
 
-    <!-- Green Bordered Outer Container -->
     <section class="stage">
       <div class="table-card">
-        <!-- Top Action Bar -->
         <div class="table-header-bar">
           <span class="table-title">Number of Books: <strong id="book-count-label">0</strong></span>
-          <button class="btn-add">
-            ADD BOOK
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-          </button>
+          <div class="table-header-actions">
+            <input type="file" id="importBooksFile" accept=".xlsx,.xls,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel" hidden>
+            <button class="btn-import-books" type="button" id="importBooksButton">UPLOAD EXCEL</button>
+            <button class="btn-add" type="button">
+              ADD BOOK
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            </button>
+          </div>
         </div>
-
-        <!-- Scrollable Table -->
         <div class="scroll" tabindex="0">
           <table class="grid-table">
             <thead>
@@ -102,110 +117,10 @@
                 <th>Book Count</th>
                 <th>Available Copies</th>
                 <th>Status</th>
+                <th>Actions</th>
               </tr>
             </thead>
-            <tbody>
-              <tr>
-                <td class="code">BK-001</td>
-                <td>Fiction</td>
-                <td class="bold">Harry Potter and the Sorcerer's Stone</td>
-                <td>J.K. Rowling</td>
-                <td class="center">06/26/1997</td>
-                <td class="center">1</td>
-                <td class="center">0</td>
-                <td class="bold">Not Available</td>
-              </tr>
-              <tr>
-                <td class="code">BK-002</td>
-                <td>Science</td>
-                <td class="bold">A Brief History of Time</td>
-                <td>Stephen Hawking</td>
-                <td class="center">04/01/1988</td>
-                <td class="center">3</td>
-                <td class="center">3</td>
-                <td class="bold">Available</td>
-              </tr>
-              <tr>
-                <td class="code">BK-003</td>
-                <td>Technology</td>
-                <td class="bold">Learning Python</td>
-                <td>Mark Lutz</td>
-                <td class="center">04/01/1988</td>
-                <td class="center">4</td>
-                <td class="center">4</td>
-                <td class="bold">Available</td>
-              </tr>
-              <tr>
-                <td class="code">BK-004</td>
-                <td>Technology</td>
-                <td class="bold">Computer Networking: A Top-Down Approach</td>
-                <td>James F. Kurose</td>
-                <td class="center">03/15/2016</td>
-                <td class="center">0</td>
-                <td class="center">0</td>
-                <td class="bold">Not Available</td>
-              </tr>
-              <tr>
-                <td class="code">BK-005</td>
-                <td>History</td>
-                <td class="bold">Sapiens: A Brief History of Humankind</td>
-                <td>Yuval Noah Harari</td>
-                <td class="center">09/04/2014</td>
-                <td class="center">2</td>
-                <td class="center">2</td>
-                <td class="bold">Available</td>
-              </tr>
-              <tr>
-                <td class="code">BK-006</td>
-                <td>Literature</td>
-                <td class="bold">Romeo and Juliet</td>
-                <td>William Shakespeare</td>
-                <td class="center">01/01/1597</td>
-                <td class="center">7</td>
-                <td class="center">7</td>
-                <td class="bold">Available</td>
-              </tr>
-              <tr>
-                <td class="code">BK-007</td>
-                <td>Culinary</td>
-                <td class="bold">Mastering the Art of Cooking</td>
-                <td>Julia Child</td>
-                <td class="center">10/16/1961</td>
-                <td class="center">3</td>
-                <td class="center">3</td>
-                <td class="bold">Available</td>
-              </tr>
-              <tr>
-                <td class="code">BK-008</td>
-                <td>Business</td>
-                <td class="bold">Rich Dad Poor Dad</td>
-                <td>Robert Kiyosaki</td>
-                <td class="center">04/08/1997</td>
-                <td class="center">5</td>
-                <td class="center">5</td>
-                <td class="bold">Available</td>
-              </tr>
-              <tr>
-                <td class="code">BK-009</td>
-                <td>Business</td>
-                <td class="bold">Gregg Shorthand College Book 1</td>
-                <td>Charles E. Zoubek</td>
-                <td class="center">04/28/1989</td>
-                <td class="center">3</td>
-                <td class="center">3</td>
-                <td class="bold">Available</td>
-              </tr>
-              <tr>
-                <td class="code">BK-0010</td>
-                <td>Business</td>
-                <td class="bold">Gregg Shorthand College Book 2</td>
-                <td>Louis A. Leslie</td>
-                <td class="center">04/28/1989</td>
-                <td class="center">4</td>
-                <td class="center">4</td>
-                <td class="bold">Available</td>
-              </tr>
-            </tbody>
+            <tbody><tr><td colspan="9">Loading book catalog...</td></tr></tbody>
           </table>
         </div>
       </div>
