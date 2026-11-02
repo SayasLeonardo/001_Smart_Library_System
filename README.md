@@ -107,6 +107,16 @@ On first startup after this update, the backend migrates the existing SQLite dat
 
 To install the barcode renderer with the other backend dependencies, rerun `.\.venv\Scripts\python.exe -m pip install -r requirements.txt`, then start the backend normally. Existing book and transaction IDs and relationships are retained.
 
+### Import book catalog from Excel
+
+Sign in as MIS Admin or Librarian, open **Book Transactions**, and choose **UPLOAD EXCEL**. The importer accepts `.xlsx` and `.xls` files up to 5 MB and up to 5,000 book rows. It scans the first 20 rows of each worksheet for a header row and matches columns by name; extra columns are ignored.
+
+Required columns are **Barcode** (or **Book Number / Barcode**), **Book Title**, **Author**, **Category**, and **Book Count** or **Quantity**. **Book Number** and **Date Published** are optional. If no separate book number is supplied, the barcode is also used as the book number. Each imported book starts with all copies available; this imports catalog inventory, not borrower or borrow/return transaction history.
+
+Rows with missing or oversized required values, a non-whole or negative copy count, or a duplicate barcode/book number are skipped and listed in the import summary. Accepted rows are saved in the existing `books` table and appear in the catalog after the upload completes.
+
+To test the feature locally, start the backend using the Windows instructions above, sign in, and prepare a workbook with columns such as `Book Number / Barcode`, `Category`, `Book Title`, `Author Name`, `Date Published`, and `Book Count`. Include one unique valid book, then try uploading the same file again to confirm duplicates are skipped. A row with a blank title or negative copy count should also be reported as skipped.
+
 ### Barcode and institutional-email checks
 
 1. Sign in as MIS Admin or Librarian and open **Book Transactions**.
