@@ -47,14 +47,16 @@ async function request(path, options) {
   return result;
 }
 
-   function setCameraStatus(status, message) {
-     const feedProblem = ["starting", "camera_error", "error", "stopped"].includes(status);
-     cameraStatus.textContent = message;
-     cameraDot.classList.toggle("ready", status === "active");
-     cameraDot.classList.toggle("error", status === "error" || status === "camera_error" || status === "backend_error");
-     cameraPlaceholder.style.display = feedProblem ? "grid" : "none";
-     if (feedProblem) cameraPlaceholder.textContent = message;
-   }
+function setCameraStatus(status, message) {
+  // Only hide the live video when the camera itself has a problem.
+  // A backend_error means the library server is slow, but the camera still works.
+  const feedProblem = ["starting", "camera_error", "error", "stopped"].includes(status);
+  cameraStatus.textContent = message;
+  cameraDot.classList.toggle("ready", status === "active");
+  cameraDot.classList.toggle("error", status === "error" || status === "camera_error" || status === "backend_error");
+  cameraPlaceholder.style.display = feedProblem ? "grid" : "none";
+  if (feedProblem) cameraPlaceholder.textContent = message;
+}
 
 function fillPerson(person) {
   personSchoolId.textContent = person.school_id || "-";
@@ -63,7 +65,7 @@ function fillPerson(person) {
   personDepartment.textContent = person.department || "-";
 }
 
-function showErrorCard(title, message) {
+function showErrorCard(title, message, dismissible) {
   recognitionCard.hidden = false;
   recognitionCard.className = "recognition-card error";
   resultEyebrow.textContent = "ATTENDANCE NOT RECORDED";
@@ -72,7 +74,10 @@ function showErrorCard(title, message) {
   personDetails.hidden = true;
   recordedTime.hidden = true;
   recordedTime.textContent = "";
-  confirmationActions.hidden = true;
+  // A failed confirmation gets a Dismiss button so the screen never gets stuck.
+  confirmationActions.hidden = !dismissible;
+  confirmButton.hidden = true;
+  cancelButton.textContent = "Dismiss";
   stationMessage.textContent = message;
   stationMessage.className = "station-message error";
 }
@@ -116,17 +121,22 @@ function renderStation(state) {
   }
 
   if (state.face_status === "unknown") {
-    showErrorCard("Face not recognized", state.message || "No registered person was found. Please contact the library administrator.");
+    showErrorCard("Face not recognized", state.message || "No registered person was found. Please contact the library administrator.", false);
     return;
   }
 
   if (state.face_status === "multiple_faces") {
-    showErrorCard("One person at a time", state.message);
+    showErrorCard("One person at a time", state.message, false);
     return;
   }
 
-  if (state.face_status === "error" || state.camera_status === "error" || state.camera_status === "backend_error") {
-    showErrorCard("Station unavailable", state.message);
+  if (state.camera_status === "error") {
+    showErrorCard("Station unavailable", state.message, false);
+    return;
+  }
+
+  if (state.face_status === "error") {
+    showErrorCard("Could not record attendance", state.message, true);
     return;
   }
 
@@ -140,6 +150,8 @@ function renderStation(state) {
     fillPerson(state.pending_person);
     recordedTime.hidden = true;
     confirmationActions.hidden = false;
+    confirmButton.hidden = false;
+    cancelButton.textContent = "Cancel";
     confirmButton.disabled = !state.can_confirm;
     confirmButton.textContent = action === "time_in" ? "Confirm Time-in" : (action === "time_out" ? "Confirm Time-out" : "Select an action first");
     stationMessage.textContent = action ? state.action_message : "Choose Time-in or Time-out, then confirm this person.";
@@ -201,10 +213,10 @@ cancelButton.addEventListener("click", async function () {
   }
 });
 
-// Live video: the <img> points at the MJPEG stream (/video_feed).
+// Live video: the <img> points at the MJPEG stream (/camera_feed).
 // If the stream drops (server restart, network blip), reconnect automatically.
 function connectFeed() {
-  cameraFeed.src = "/video_feed?t=" + Date.now();
+  cameraFeed.src = "/camera_feed?t=" + Date.now();
 }
 
 cameraFeed.addEventListener("load", function () {
