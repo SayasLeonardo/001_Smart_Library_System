@@ -8,11 +8,32 @@ from face_detector import FaceDetector
 
 class FaceRecognizer:
     def __init__(self, detector_model, recognizer_model, threshold=0.363):
+        self._detector_model = detector_model
+        self._recognizer_model = recognizer_model
         self.detector = FaceDetector(detector_model)
         self.recognizer = cv2.FaceRecognizerSF.create(str(recognizer_model), "")
         self.threshold = threshold
 
+    def clone(self):
+        """Return an independent recognizer for use in another thread."""
+        return FaceRecognizer(self._detector_model, self._recognizer_model, self.threshold)
+
+    @staticmethod
+    def _as_bgr(image):
+        if image is None or getattr(image, "size", 0) == 0:
+            raise ValueError("The image is empty.")
+        if image.dtype != np.uint8:
+            image = cv2.convertScaleAbs(image)
+        if image.ndim == 2:
+            return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        if image.ndim == 3 and image.shape[2] == 4:
+            return cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+        if image.ndim == 3 and image.shape[2] == 3:
+            return np.ascontiguousarray(image)
+        raise ValueError("Unsupported image format.")
+
     def encode(self, image):
+        image = self._as_bgr(image)
         faces = self.detector.detect(image)
         if not faces:
             raise ValueError(
