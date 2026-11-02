@@ -35,6 +35,17 @@ STATE = {
 }
 
 
+def get_api_settings():
+    """Read the Render API URL and IoT key from environment variables only."""
+    url = os.environ.get("SMART_LIBRARY_API_URL")
+    key = os.environ.get("SMART_LIBRARY_IOT_KEY")
+    if not url or not key:
+        raise RuntimeError(
+            "Set SMART_LIBRARY_API_URL and SMART_LIBRARY_IOT_KEY on this station."
+        )
+    return url, key
+
+
 def update_state(**values):
     with STATE_LOCK:
         STATE.update(values)
@@ -58,10 +69,7 @@ def camera_worker():
     global LATEST_JPEG, PENDING_AT
     camera = None
     try:
-        api_url = os.environ.get("SMART_LIBRARY_API_URL", "https://smart-library-system-xthn.onrender.com")
-        api_key = os.environ.get("SMART_LIBRARY_IOT_KEY", "3563d09a6d37d2fa67f0f872dbad2e67")
-        if not api_key:
-            raise RuntimeError("SMART_LIBRARY_IOT_KEY is not configured for this station.")
+        api_url, api_key = get_api_settings()
 
         models = ensure_models()
         recognizer = FaceRecognizer(
@@ -259,10 +267,7 @@ def confirm_attendance():
         return jsonify({"error": message}), 409
 
     try:
-        library_api = SmartLibraryApi(
-            os.environ.get("SMART_LIBRARY_API_URL", "https://final-the-smart-library-system.onrender.com"),
-            os.environ.get("SMART_LIBRARY_IOT_KEY", "4dd067e0d7f1b713db2614029ed2a3a0"),
-        )
+        library_api = SmartLibraryApi(*get_api_settings())
         saved = library_api.record_attendance(person, action.replace("_", "-"))
     except (RuntimeError, ValueError) as error:
         with STATE_LOCK:
