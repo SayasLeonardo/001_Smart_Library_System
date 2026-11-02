@@ -22,6 +22,8 @@ const confirmationActions = document.getElementById("confirmationActions");
 const confirmButton = document.getElementById("confirmButton");
 const cancelButton = document.getElementById("cancelButton");
 
+let feedRetryTimer = null;
+
 function formatManilaTimestamp(value) {
   const timestamp = new Date(value);
   if (Number.isNaN(timestamp.getTime())) return value;
@@ -198,13 +200,26 @@ cancelButton.addEventListener("click", async function () {
   }
 });
 
+// Live video: the <img> points at the MJPEG stream (/video_feed).
+// If the stream drops (server restart, network blip), reconnect automatically.
+function connectFeed() {
+  cameraFeed.src = "/video_feed?t=" + Date.now();
+}
+
 cameraFeed.addEventListener("load", function () {
   cameraPlaceholder.style.display = "none";
 });
 cameraFeed.addEventListener("error", function () {
   cameraPlaceholder.style.display = "grid";
-  cameraPlaceholder.textContent = "Camera feed unavailable";
+  cameraPlaceholder.textContent = "Camera feed unavailable. Reconnecting...";
+  if (feedRetryTimer === null) {
+    feedRetryTimer = window.setTimeout(function () {
+      feedRetryTimer = null;
+      connectFeed();
+    }, 2000);
+  }
 });
 
+connectFeed();
 refreshStation();
 window.setInterval(refreshStation, 500);
