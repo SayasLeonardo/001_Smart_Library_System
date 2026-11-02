@@ -47,13 +47,14 @@ async function request(path, options) {
   return result;
 }
 
-function setCameraStatus(status, message) {
-  cameraStatus.textContent = message;
-  cameraDot.classList.toggle("ready", status === "active");
-  cameraDot.classList.toggle("error", status === "error" || status === "camera_error" || status === "backend_error");
-  cameraPlaceholder.style.display = status === "active" ? "none" : "grid";
-  if (status !== "active") cameraPlaceholder.textContent = message;
-}
+   function setCameraStatus(status, message) {
+     const feedProblem = ["starting", "camera_error", "error", "stopped"].includes(status);
+     cameraStatus.textContent = message;
+     cameraDot.classList.toggle("ready", status === "active");
+     cameraDot.classList.toggle("error", status === "error" || status === "camera_error" || status === "backend_error");
+     cameraPlaceholder.style.display = feedProblem ? "grid" : "none";
+     if (feedProblem) cameraPlaceholder.textContent = message;
+   }
 
 function fillPerson(person) {
   personSchoolId.textContent = person.school_id || "-";
