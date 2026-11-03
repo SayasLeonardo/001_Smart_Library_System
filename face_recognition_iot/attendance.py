@@ -62,6 +62,13 @@ class SmartLibraryApi:
             raise RuntimeError(error)
         return templates
 
+    def mark_inside(self, person_id, inside):
+        """Update the cached person right after a successful record, before the next sync."""
+        with self._lock:
+            for person in self._templates:
+                if person["id"] == person_id:
+                    person["is_inside"] = inside
+
     def _sync(self, recognizer):
         try:
             if self._worker_recognizer is None:
