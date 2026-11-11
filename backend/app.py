@@ -43,6 +43,11 @@ UPLOAD_ROOT = (DATA_DIR / "uploads") if DATA_DIR else (Path(__file__).resolve().
 COVER_DIRECTORY = UPLOAD_ROOT / "book_covers"
 FACE_DIRECTORY = UPLOAD_ROOT / "person_faces"
 IS_RENDER = os.environ.get("RENDER") == "true"
+# Any other production host (e.g. a Hostinger VPS) sets SMART_LIBRARY_PRODUCTION=1 and, when
+# Nginx/another proxy sits in front of Gunicorn, SMART_LIBRARY_BEHIND_PROXY=1. Render keeps
+# working exactly as before because RENDER=true turns both on.
+IS_PRODUCTION = IS_RENDER or os.environ.get("SMART_LIBRARY_PRODUCTION") == "1"
+BEHIND_PROXY = IS_RENDER or os.environ.get("SMART_LIBRARY_BEHIND_PROXY") == "1"
 # With PostgreSQL, uploaded images are stored in the database (Render's free web service has
 # no permanent disk). Without it, they stay on disk exactly as before.
 STORE_FILES_IN_DATABASE = USING_POSTGRES
@@ -51,18 +56,19 @@ MANILA_TIME = ZoneInfo("Asia/Manila")
 app = Flask(__name__)
 _secret_key = os.environ.get("SMART_LIBRARY_SECRET", "")
 if not _secret_key:
-    if IS_RENDER:
-        raise RuntimeError("SMART_LIBRARY_SECRET must be set when running on Render.")
+    if IS_PRODUCTION:
+        raise RuntimeError("SMART_LIBRARY_SECRET must be set in production.")
     _secret_key = "local-development-key-change-before-deployment"
 app.config.update(
     SECRET_KEY=_secret_key,
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=os.environ.get("SMART_LIBRARY_HTTPS", "1" if IS_RENDER else "0") == "1",
+    SESSION_COOKIE_SECURE=os.environ.get("SMART_LIBRARY_HTTPS", "1" if IS_PRODUCTION else "0") == "1",
     MAX_CONTENT_LENGTH=MAX_COVER_SIZE + 64 * 1024,
 )
-if IS_RENDER:
-    # Render terminates HTTPS at its proxy; trust one hop so Flask sees https and the real client.
+if BEHIND_PROXY:
+    # HTTPS is terminated by the proxy (Render, or Nginx on a VPS); trust one hop so Flask sees
+    # https and the real client address (used by the password-recovery rate limits).
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 initialize_database()
 
@@ -2589,7 +2595,8 @@ def import_books():
 @app.route("/<path:requested_path>", methods=["GET", "HEAD"])
 def frontend_files(requested_path):
     lower_path = requested_path.lower()
-    if (lower_path.startswith((".", "backend/", "face_recognition_iot/", "uploads/", "models/"))
+    if (lower_path.startswith((".", "backend/", "face_recognition_iot/", "deploy/", "uploads/", "models/"))
+            or lower_path.endswith((".md", ".py", ".yaml", ".yml", ".sh", ".service", ".conf", ".env", ".example", ".db"))
             or lower_path.startswith("smart_library.db")
             or lower_path in {"render.yaml", "requirements.txt", "build.sh", "runtime.txt"}):
         abort(404)

@@ -1,0 +1,16 @@
+[Unit]
+Description=Smart Library face-recognition station
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=__USER__
+SupplementaryGroups=video
+WorkingDirectory=__STATION_DIR__
+EnvironmentFile=/etc/smart-library-station.env
+ExecStart=__VENV__/bin/python app.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

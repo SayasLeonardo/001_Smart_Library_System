@@ -1,0 +1,24 @@
+[Unit]
+Description=Smart Library System (Gunicorn)
+After=network.target
+
+[Service]
+User=smartlib
+Group=smartlib
+WorkingDirectory=/opt/smart-library
+EnvironmentFile=/etc/smart-library/smart-library.env
+# One worker on purpose: the app starts a background face-registration thread and, with SQLite,
+# uses a single writer. Four threads are plenty for a library.
+ExecStart=/opt/smart-library/.venv/bin/gunicorn --chdir backend app:app --workers 1 --threads 4 --timeout 120 --bind 127.0.0.1:8000
+Restart=always
+RestartSec=3
+
+# Hardening: the app may only write to its data folder.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/smart-library
+
+[Install]
+WantedBy=multi-user.target

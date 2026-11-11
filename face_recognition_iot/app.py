@@ -29,6 +29,16 @@ PENDING_AT = 0.0
 CAMERA_THREAD = None
 LIBRARY_API = None
 
+# Optional automatic attendance (OFF by default; the confirm-first flow is unchanged unless enabled).
+# Set SMART_LIBRARY_AUTO_ATTENDANCE=1 on the Raspberry Pi to record Time-in/Time-out as soon as a
+# registered, active person is recognized. The server still rejects duplicate Time-ins and
+# invalid Time-outs, and a person must leave the camera view before they can be recorded again.
+AUTO_ATTENDANCE = os.environ.get("SMART_LIBRARY_AUTO_ATTENDANCE", "0") == "1"
+AUTO_COOLDOWN = int(os.environ.get("SMART_LIBRARY_AUTO_COOLDOWN", "60"))  # seconds per person
+AUTO_RETRY_SECONDS = 5    # retry delay after a failed automatic save (e.g. network drop)
+AUTO_LOCK = threading.Lock()
+AUTO_STATE = {"busy": False, "blocked_id": None, "last_at": {}}
+
 CONFIRM_WINDOW = 20       # seconds a recognition stays valid for confirmation
 RESET_AFTER_NO_FACE = 5   # seconds without a face before old results are cleared
 RETRY_SECONDS = 5         # wait before restarting the station after a failure
@@ -82,6 +92,62 @@ def selected_action_message(person, action):
     if action == "time_out" and not person["is_inside"]:
         return "Time-out cannot be recorded. No active Time-in was found for this person.", False
     return "Confirm the selected attendance action below.", True
+
+
+def auto_record_attendance(person):
+    """Auto mode only: save Time-in or Time-out for a recognized person (runs in a thread)."""
+    global PENDING_AT
+    person_id = person["id"]
+    try:
+        library_api = LIBRARY_API
+        if library_api is None:
+            raise RuntimeError("The station is still starting.")
+        if person.get("status") != "active":
+            return
+        action = "time_out" if person["is_inside"] else "time_in"
+        with CONFIRM_LOCK:
+            saved = library_api.record_attendance(person, action.replace("_", "-"))
+            event = str(saved.get("event", action)).replace("-", "_")
+            action_label = "time_in" if event == "time_in" else "time_out"
+            library_api.mark_inside(person_id, action_label == "time_in")
+            with STATE_LOCK:
+                STATE["pending_person"] = None
+                STATE["selected_action"] = None
+                STATE["face_status"] = "recorded"
+                STATE["result"] = {
+                    "action": action_label,
+                    "person": saved.get("person") or person,
+                    "timestamp": saved.get("timestamp", ""),
+                }
+                STATE["message"] = "Attendance saved to the Smart Library System."
+                PENDING_AT = 0.0
+    except (RuntimeError, ValueError) as error:
+        with STATE_LOCK:
+            STATE["face_status"] = "error"
+            STATE["message"] = str(error)
+        with AUTO_LOCK:  # allow a retry shortly, without hammering the server
+            AUTO_STATE["blocked_id"] = None
+            AUTO_STATE["last_at"][person_id] = time.monotonic() - AUTO_COOLDOWN + AUTO_RETRY_SECONDS
+    finally:
+        with AUTO_LOCK:
+            AUTO_STATE["busy"] = False
+
+
+def maybe_auto_record(person, now):
+    """Start an automatic save unless one is running, the person was just recorded, or is cooling down."""
+    if not AUTO_ATTENDANCE:
+        return
+    with AUTO_LOCK:
+        if AUTO_STATE["busy"] or AUTO_STATE["blocked_id"] == person["id"]:
+            return
+        if now - AUTO_STATE["last_at"].get(person["id"], -AUTO_COOLDOWN) < AUTO_COOLDOWN:
+            return
+        AUTO_STATE["busy"] = True
+        AUTO_STATE["blocked_id"] = person["id"]
+        AUTO_STATE["last_at"][person["id"]] = now
+    threading.Thread(
+        target=auto_record_attendance, args=(copy.deepcopy(person),), name="auto-attendance", daemon=True
+    ).start()
 
 
 def run_station():
@@ -163,6 +229,8 @@ def run_station():
                     active_person_id = None
                     unknown_count = 0
                     overlay = None
+                    with AUTO_LOCK:  # the person left the view: they can be recorded again later
+                        AUTO_STATE["blocked_id"] = None
 
             if len(faces) == 1:
                 if frame_number % 5 == 0:
@@ -182,10 +250,14 @@ def run_station():
                                     STATE["pending_person"] = public
                                     STATE["face_status"] = "recognized"
                                     STATE["result"] = None
-                                    STATE["message"] = "Face recognized. Choose an attendance action."
+                                    STATE["message"] = (
+                                        "Face recognized. Saving attendance..."
+                                        if AUTO_ATTENDANCE else "Face recognized. Choose an attendance action."
+                                    )
                                     PENDING_AT = now
                                 elif STATE["pending_person"] and STATE["pending_person"]["id"] == person["id"]:
                                     PENDING_AT = now  # still in front of the camera: keep it valid
+                            maybe_auto_record(public, now)
                             active_person_id = person["id"]
                             last_person_seen = now
                         else:
