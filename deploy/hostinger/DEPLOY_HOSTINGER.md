@@ -91,24 +91,24 @@ systemctl start smart-library
 Registered faces are stored inside the database, so recognition works immediately. The app upgrades the
 database structure itself at start-up; existing accounts, books, transactions and attendance are kept.
 
-### Option B: data is on Render (PostgreSQL)
+### Option B: data is in your old online PostgreSQL database
 
-Render's free PostgreSQL database is deleted about 6 weeks after creation (see `DEPLOY_NOTES.md`), so do this soon.
+Use this if your records live in the PostgreSQL database of your previous online deployment. **Copy the data before you delete that database.** Once it is deleted it cannot be recovered.
 
 ```bash
 sudo apt-get install -y postgresql postgresql-client
 sudo -u postgres psql -c "CREATE USER smartlib WITH PASSWORD 'CHOOSE_A_STRONG_PASSWORD';"
 sudo -u postgres psql -c "CREATE DATABASE smartlib OWNER smartlib;"
 
-# Copy the EXTERNAL database URL from the Render dashboard (library-db > Connections)
-pg_dump --no-owner --no-acl "RENDER_EXTERNAL_DATABASE_URL" > /root/render.sql
-psql "postgresql://smartlib:CHOOSE_A_STRONG_PASSWORD@127.0.0.1:5432/smartlib" -f /root/render.sql
+# Use the EXTERNAL connection URL of the old database (from its provider's dashboard)
+pg_dump --no-owner --no-acl "OLD_DATABASE_EXTERNAL_URL" > /root/old-database.sql
+psql "postgresql://smartlib:CHOOSE_A_STRONG_PASSWORD@127.0.0.1:5432/smartlib" -f /root/old-database.sql
 ```
 
 Then edit `/etc/smart-library/smart-library.env`, uncomment `DATABASE_URL=` and set it to
 `postgresql://smartlib:CHOOSE_A_STRONG_PASSWORD@127.0.0.1:5432/smartlib`, and run
 `systemctl restart smart-library`. Uploaded images are stored inside this database, so they move with it.
-(If `pg_dump` reports a version mismatch, install the PostgreSQL client version that matches Render's server.)
+(If `pg_dump` reports a version mismatch, install the PostgreSQL client version that matches the old server.)
 
 ## 5. First sign-in and security
 
@@ -163,8 +163,10 @@ and consider Hostinger's VPS backup/snapshot feature as well.
 
 ## 9. What was changed in the code
 
-- `backend/app.py`: production settings now work on any host (`SMART_LIBRARY_PRODUCTION`, `SMART_LIBRARY_BEHIND_PROXY`;
-  Render still works through `RENDER=true`); the web server also refuses to serve project files such as `*.md`, `*.py`, `deploy/`.
+- `backend/app.py`: production settings are controlled by `SMART_LIBRARY_PRODUCTION` and `SMART_LIBRARY_BEHIND_PROXY`;
+  the web server also refuses to serve project files such as `*.md`, `*.py`, `deploy/`.
+- All Render-specific code was removed (`RENDER` setting, `render.yaml`, `DEPLOY_NOTES.md`, Render comments).
+  PostgreSQL support stays, because Option B above uses it.
 - `face_recognition_iot/app.py`: optional automatic attendance (`SMART_LIBRARY_AUTO_ATTENDANCE=1`, off by default).
 - New: `deploy/hostinger/*`, `face_recognition_iot/raspberry_pi/*`, `.gitattributes`.
 

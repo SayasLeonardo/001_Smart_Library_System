@@ -60,7 +60,7 @@ STATE = {
 
 
 def get_api_settings():
-    """Read the Render API URL and IoT key from environment variables only."""
+    """Read the Smart Library API URL and IoT key from environment variables only."""
     url = os.environ.get("SMART_LIBRARY_API_URL")
     key = os.environ.get("SMART_LIBRARY_IOT_KEY")
     if not url or not key:

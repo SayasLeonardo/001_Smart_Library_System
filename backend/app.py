@@ -37,19 +37,17 @@ except ModuleNotFoundError:  # pragma: no cover - supports running from repo roo
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-# Uploads live on the Render persistent disk when SMART_LIBRARY_DATA_DIR is set,
+# Uploads live in SMART_LIBRARY_DATA_DIR/uploads when that folder is set (the Hostinger VPS),
 # otherwise in the original backend/uploads folder.
 UPLOAD_ROOT = (DATA_DIR / "uploads") if DATA_DIR else (Path(__file__).resolve().parent / "uploads")
 COVER_DIRECTORY = UPLOAD_ROOT / "book_covers"
 FACE_DIRECTORY = UPLOAD_ROOT / "person_faces"
-IS_RENDER = os.environ.get("RENDER") == "true"
-# Any other production host (e.g. a Hostinger VPS) sets SMART_LIBRARY_PRODUCTION=1 and, when
-# Nginx/another proxy sits in front of Gunicorn, SMART_LIBRARY_BEHIND_PROXY=1. Render keeps
-# working exactly as before because RENDER=true turns both on.
-IS_PRODUCTION = IS_RENDER or os.environ.get("SMART_LIBRARY_PRODUCTION") == "1"
-BEHIND_PROXY = IS_RENDER or os.environ.get("SMART_LIBRARY_BEHIND_PROXY") == "1"
-# With PostgreSQL, uploaded images are stored in the database (Render's free web service has
-# no permanent disk). Without it, they stay on disk exactly as before.
+# A production server (e.g. the Hostinger VPS) sets SMART_LIBRARY_PRODUCTION=1 and, because
+# Nginx sits in front of Gunicorn, SMART_LIBRARY_BEHIND_PROXY=1.
+IS_PRODUCTION = os.environ.get("SMART_LIBRARY_PRODUCTION") == "1"
+BEHIND_PROXY = os.environ.get("SMART_LIBRARY_BEHIND_PROXY") == "1"
+# With PostgreSQL, uploaded images are stored in the database. Without it, they stay on disk
+# exactly as before.
 STORE_FILES_IN_DATABASE = USING_POSTGRES
 MAX_COVER_SIZE = 5 * 1024 * 1024
 MANILA_TIME = ZoneInfo("Asia/Manila")
@@ -67,7 +65,7 @@ app.config.update(
     MAX_CONTENT_LENGTH=MAX_COVER_SIZE + 64 * 1024,
 )
 if BEHIND_PROXY:
-    # HTTPS is terminated by the proxy (Render, or Nginx on a VPS); trust one hop so Flask sees
+    # HTTPS is terminated by the proxy (Nginx on the VPS); trust one hop so Flask sees
     # https and the real client address (used by the password-recovery rate limits).
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 initialize_database()
@@ -2598,7 +2596,7 @@ def frontend_files(requested_path):
     if (lower_path.startswith((".", "backend/", "face_recognition_iot/", "deploy/", "uploads/", "models/"))
             or lower_path.endswith((".md", ".py", ".yaml", ".yml", ".sh", ".service", ".conf", ".env", ".example", ".db"))
             or lower_path.startswith("smart_library.db")
-            or lower_path in {"render.yaml", "requirements.txt", "build.sh", "runtime.txt"}):
+            or lower_path in {"requirements.txt", "build.sh", "runtime.txt"}):
         abort(404)
     file_path = (PROJECT_ROOT / requested_path).resolve()
     if not file_path.is_relative_to(PROJECT_ROOT) or not file_path.is_file():

@@ -1,18 +1,27 @@
 --- ../orig/backend/app.py	2026-11-11 07:28:47.425852430 +0000
-+++ backend/app.py	2026-11-11 07:28:47.468171647 +0000
-@@ -43,6 +43,11 @@
++++ backend/app.py	2026-11-11 12:26:56.088691072 +0000
+@@ -37,32 +37,36 @@
+ 
+ 
+ PROJECT_ROOT = Path(__file__).resolve().parent.parent
+-# Uploads live on the Render persistent disk when SMART_LIBRARY_DATA_DIR is set,
++# Uploads live in SMART_LIBRARY_DATA_DIR/uploads when that folder is set (the Hostinger VPS),
+ # otherwise in the original backend/uploads folder.
+ UPLOAD_ROOT = (DATA_DIR / "uploads") if DATA_DIR else (Path(__file__).resolve().parent / "uploads")
  COVER_DIRECTORY = UPLOAD_ROOT / "book_covers"
  FACE_DIRECTORY = UPLOAD_ROOT / "person_faces"
- IS_RENDER = os.environ.get("RENDER") == "true"
-+# Any other production host (e.g. a Hostinger VPS) sets SMART_LIBRARY_PRODUCTION=1 and, when
-+# Nginx/another proxy sits in front of Gunicorn, SMART_LIBRARY_BEHIND_PROXY=1. Render keeps
-+# working exactly as before because RENDER=true turns both on.
-+IS_PRODUCTION = IS_RENDER or os.environ.get("SMART_LIBRARY_PRODUCTION") == "1"
-+BEHIND_PROXY = IS_RENDER or os.environ.get("SMART_LIBRARY_BEHIND_PROXY") == "1"
- # With PostgreSQL, uploaded images are stored in the database (Render's free web service has
- # no permanent disk). Without it, they stay on disk exactly as before.
+-IS_RENDER = os.environ.get("RENDER") == "true"
+-# With PostgreSQL, uploaded images are stored in the database (Render's free web service has
+-# no permanent disk). Without it, they stay on disk exactly as before.
++# A production server (e.g. the Hostinger VPS) sets SMART_LIBRARY_PRODUCTION=1 and, because
++# Nginx sits in front of Gunicorn, SMART_LIBRARY_BEHIND_PROXY=1.
++IS_PRODUCTION = os.environ.get("SMART_LIBRARY_PRODUCTION") == "1"
++BEHIND_PROXY = os.environ.get("SMART_LIBRARY_BEHIND_PROXY") == "1"
++# With PostgreSQL, uploaded images are stored in the database. Without it, they stay on disk
++# exactly as before.
  STORE_FILES_IN_DATABASE = USING_POSTGRES
-@@ -51,18 +56,19 @@
+ MAX_COVER_SIZE = 5 * 1024 * 1024
+ MANILA_TIME = ZoneInfo("Asia/Manila")
  app = Flask(__name__)
  _secret_key = os.environ.get("SMART_LIBRARY_SECRET", "")
  if not _secret_key:
@@ -32,12 +41,12 @@
 -if IS_RENDER:
 -    # Render terminates HTTPS at its proxy; trust one hop so Flask sees https and the real client.
 +if BEHIND_PROXY:
-+    # HTTPS is terminated by the proxy (Render, or Nginx on a VPS); trust one hop so Flask sees
++    # HTTPS is terminated by the proxy (Nginx on the VPS); trust one hop so Flask sees
 +    # https and the real client address (used by the password-recovery rate limits).
      app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
  initialize_database()
  
-@@ -2589,7 +2595,8 @@
+@@ -2589,9 +2593,10 @@
  @app.route("/<path:requested_path>", methods=["GET", "HEAD"])
  def frontend_files(requested_path):
      lower_path = requested_path.lower()
@@ -45,10 +54,65 @@
 +    if (lower_path.startswith((".", "backend/", "face_recognition_iot/", "deploy/", "uploads/", "models/"))
 +            or lower_path.endswith((".md", ".py", ".yaml", ".yml", ".sh", ".service", ".conf", ".env", ".example", ".db"))
              or lower_path.startswith("smart_library.db")
-             or lower_path in {"render.yaml", "requirements.txt", "build.sh", "runtime.txt"}):
+-            or lower_path in {"render.yaml", "requirements.txt", "build.sh", "runtime.txt"}):
++            or lower_path in {"requirements.txt", "build.sh", "runtime.txt"}):
          abort(404)
+     file_path = (PROJECT_ROOT / requested_path).resolve()
+     if not file_path.is_relative_to(PROJECT_ROOT) or not file_path.is_file():
+--- ../orig/backend/database.py	2026-11-11 07:28:47.425894463 +0000
++++ backend/database.py	2026-11-11 12:26:56.089785809 +0000
+@@ -1,7 +1,7 @@
+ """Database setup and starter records for the Smart Library System.
+ 
+ Two backends are supported:
+-  * PostgreSQL when the DATABASE_URL environment variable is set (used on Render).
++  * PostgreSQL when the DATABASE_URL environment variable is set.
+   * SQLite otherwise (local development, unchanged behaviour).
+ 
+ The application's SQL is written in SQLite style. For PostgreSQL it is translated at
+@@ -19,8 +19,8 @@
+ from werkzeug.security import generate_password_hash
+ 
+ 
+-# On Render, SMART_LIBRARY_DATA_DIR points at the persistent disk (e.g. /var/data) so the
+-# database and uploaded images survive deploys and restarts. When it is not set, the
++# On the server, SMART_LIBRARY_DATA_DIR points at a permanent folder (e.g. /var/lib/smart-library)
++# so the database and uploaded images survive updates and restarts. When it is not set, the
+ # original local-development locations are used unchanged.
+ _DATA_DIR_SETTING = os.environ.get("SMART_LIBRARY_DATA_DIR", "").strip()
+ DATA_DIR = Path(_DATA_DIR_SETTING).resolve() if _DATA_DIR_SETTING else None
+@@ -405,8 +405,7 @@
+             attempts INTEGER NOT NULL DEFAULT 0,
+             PRIMARY KEY (action, key_hash, window_start)
+         )""",
+-        # Uploaded images live in the database because Render's free web service has no
+-        # permanent disk.
++        # Uploaded images live in the database when PostgreSQL is used.
+         f"""CREATE TABLE IF NOT EXISTS stored_files (
+             kind TEXT NOT NULL,
+             name TEXT NOT NULL,
+--- ../orig/backend/face_enrollment.py	2026-11-11 07:28:47.425916538 +0000
++++ backend/face_enrollment.py	2026-11-11 12:26:56.090183910 +0000
+@@ -4,7 +4,7 @@
+ station, with the same alignment and L2 normalisation, so encodings created here are
+ interchangeable with the ones the station creates.
+ 
+-Run `python backend/face_enrollment.py` during the Render build to pre-download models.
++Run `python backend/face_enrollment.py` during server setup to pre-download the models.
+ """
+ 
+ import math
+@@ -27,7 +27,7 @@
+     ),
+ }
+ MIN_MODEL_BYTES = 100_000  # guards against saving an HTML/LFS-pointer error page as a model
+-MAX_SIDE = 1280  # keeps memory low on Render's free instance
++MAX_SIDE = 1280  # keeps memory use low on small servers
+ ENCODING_SIZE = 128
+ 
+ 
 --- ../orig/face_recognition_iot/app.py	2026-11-11 07:28:47.426004183 +0000
-+++ face_recognition_iot/app.py	2026-11-11 07:29:00.218557588 +0000
++++ face_recognition_iot/app.py	2026-11-11 12:26:56.090465424 +0000
 @@ -29,6 +29,16 @@
  CAMERA_THREAD = None
  LIBRARY_API = None
@@ -66,6 +130,15 @@
  CONFIRM_WINDOW = 20       # seconds a recognition stays valid for confirmation
  RESET_AFTER_NO_FACE = 5   # seconds without a face before old results are cleared
  RETRY_SECONDS = 5         # wait before restarting the station after a failure
+@@ -50,7 +60,7 @@
+ 
+ 
+ def get_api_settings():
+-    """Read the Render API URL and IoT key from environment variables only."""
++    """Read the Smart Library API URL and IoT key from environment variables only."""
+     url = os.environ.get("SMART_LIBRARY_API_URL")
+     key = os.environ.get("SMART_LIBRARY_IOT_KEY")
+     if not url or not key:
 @@ -84,6 +94,62 @@
      return "Confirm the selected attendance action below.", True
  

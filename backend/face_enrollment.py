@@ -4,7 +4,7 @@ Uses the same OpenCV YuNet (detection) and SFace (recognition) models as the cam
 station, with the same alignment and L2 normalisation, so encodings created here are
 interchangeable with the ones the station creates.
 
-Run `python backend/face_enrollment.py` during the Render build to pre-download models.
+Run `python backend/face_enrollment.py` during server setup to pre-download the models.
 """
 
 import math
@@ -27,7 +27,7 @@ MODEL_URLS = {
     ),
 }
 MIN_MODEL_BYTES = 100_000  # guards against saving an HTML/LFS-pointer error page as a model
-MAX_SIDE = 1280  # keeps memory low on Render's free instance
+MAX_SIDE = 1280  # keeps memory use low on small servers
 ENCODING_SIZE = 128
 
 

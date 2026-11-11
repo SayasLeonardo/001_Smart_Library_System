@@ -1,7 +1,7 @@
 """Database setup and starter records for the Smart Library System.
 
 Two backends are supported:
-  * PostgreSQL when the DATABASE_URL environment variable is set (used on Render).
+  * PostgreSQL when the DATABASE_URL environment variable is set.
   * SQLite otherwise (local development, unchanged behaviour).
 
 The application's SQL is written in SQLite style. For PostgreSQL it is translated at
@@ -19,8 +19,8 @@ from pathlib import Path
 from werkzeug.security import generate_password_hash
 
 
-# On Render, SMART_LIBRARY_DATA_DIR points at the persistent disk (e.g. /var/data) so the
-# database and uploaded images survive deploys and restarts. When it is not set, the
+# On the server, SMART_LIBRARY_DATA_DIR points at a permanent folder (e.g. /var/lib/smart-library)
+# so the database and uploaded images survive updates and restarts. When it is not set, the
 # original local-development locations are used unchanged.
 _DATA_DIR_SETTING = os.environ.get("SMART_LIBRARY_DATA_DIR", "").strip()
 DATA_DIR = Path(_DATA_DIR_SETTING).resolve() if _DATA_DIR_SETTING else None
@@ -405,8 +405,7 @@ def _postgres_schema():
             attempts INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (action, key_hash, window_start)
         )""",
-        # Uploaded images live in the database because Render's free web service has no
-        # permanent disk.
+        # Uploaded images live in the database when PostgreSQL is used.
         f"""CREATE TABLE IF NOT EXISTS stored_files (
             kind TEXT NOT NULL,
             name TEXT NOT NULL,
